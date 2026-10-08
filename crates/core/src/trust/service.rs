@@ -164,6 +164,7 @@ impl TrustApi for TrustService {
     ///
     /// # Returns
     /// - `Result<Trust, TrustProviderError>` - The created trust or an error.
+    #[tracing::instrument(name = "provider.trust.create_trust", level = "debug", skip_all)]
     async fn create_trust<'a>(
         &self,
         ctx: &ExecutionContext<'a>,
@@ -286,6 +287,7 @@ impl TrustApi for TrustService {
     ///
     /// # Returns
     /// - `Result<(), TrustProviderError>` - `Ok(())` on success, or an error.
+    #[tracing::instrument(name = "provider.trust.delete_trust", level = "debug", skip_all, fields(id = %id))]
     async fn delete_trust<'a>(
         &self,
         ctx: &ExecutionContext<'a>,
@@ -336,7 +338,7 @@ impl TrustApi for TrustService {
         // `"expired_trust"` (there is no separate automatic-expiry
         // revocation path today; expiry is checked passively at validation
         // time via the token's own `expires_at`).
-        crate::token::TOKEN_METRICS.revoked_total.inc(["cascade"]);
+        crate::token::TOKEN_METRICS.record_revoked("cascade");
 
         Ok(())
     }
@@ -350,6 +352,7 @@ impl TrustApi for TrustService {
     /// # Returns
     /// - `Result<Option<Trust>, TrustProviderError>` - A `Result` containing an
     ///   `Option` with the trust if found, or an `Error`.
+    #[tracing::instrument(name = "provider.trust.get_trust", level = "debug", skip_all, fields(id = %id))]
     async fn get_trust<'a>(
         &self,
         ctx: &ExecutionContext<'a>,
@@ -398,6 +401,7 @@ impl TrustApi for TrustService {
     /// - `Result<Option<Vec<Trust>>, TrustProviderError>` - A `Result`
     ///   containing an `Option` with the trust delegation chain if found, or an
     ///   `Error`.
+    #[tracing::instrument(name = "provider.trust.get_trust_delegation_chain", level = "debug", skip_all, fields(id = %id))]
     async fn get_trust_delegation_chain<'a>(
         &self,
         ctx: &ExecutionContext<'a>,
@@ -417,6 +421,7 @@ impl TrustApi for TrustService {
     /// # Returns
     /// - `Result<Vec<Trust>, TrustProviderError>` - A list of trusts or an
     ///   error.
+    #[tracing::instrument(name = "provider.trust.list_trusts", level = "debug", skip_all, fields(params = ?params))]
     async fn list_trusts<'a>(
         &self,
         ctx: &ExecutionContext<'a>,
@@ -472,6 +477,11 @@ impl TrustApi for TrustService {
     /// # Returns
     /// - `Result<bool, TrustProviderError>` - Ok(true) if the chain is valid,
     ///   or an error.
+    #[tracing::instrument(
+        name = "provider.trust.validate_trust_delegation_chain",
+        level = "debug",
+        skip_all
+    )]
     async fn validate_trust_delegation_chain<'a>(
         &self,
         ctx: &ExecutionContext<'a>,

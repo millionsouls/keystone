@@ -27,7 +27,6 @@ members = [
   "crates/limit-driver-sql",
   "crates/local-emergency-store",
   "crates/mapping-driver-raft",
-  "crates/metrics",
   "crates/oauth2-client-driver-raft",
   "crates/oauth2-key-driver-raft",
   "crates/oauth2-session-driver-raft",
@@ -43,6 +42,7 @@ members = [
   "crates/storage-crypto",
   "crates/storage-crypto-pkcs11",
   "crates/storage-crypto-tpm",
+  "crates/telemetry",
   "crates/token-driver-fernet",
   "crates/token-driver-jws",
   "crates/token-restriction-driver-sql",
@@ -57,7 +57,8 @@ default-members = [
   "crates/*",
 ]
 exclude = [
-  "tests/loadtest"
+  "tests/loadtest",
+  "tests/otel-bench"
 ]
 resolver = "3"
 
@@ -147,6 +148,10 @@ openstack-keystone-auth-plugin-runtime = { version = "0.1.0", path = "crates/aut
 openstack-keystone-storage-api = { version = "0.1.0", path = "crates/storage-api" }
 openstack-keystone-storage-crypto = { version = "0.1.0", path = "crates/storage-crypto" }
 openstack-keystone-storage-crypto-pkcs11 = { version = "0.1.0", path = "crates/storage-crypto-pkcs11" }
+opentelemetry = { version = "0.33", default-features = false }
+opentelemetry-otlp = { version = "0.33", default-features = false }
+opentelemetry_sdk = { version = "0.33", default-features = false }
+openstack-keystone-telemetry = { version = "0.1.0", path = "crates/telemetry" }
 openstack-keystone-storage-crypto-tpm = { version = "0.1.0", path = "crates/storage-crypto-tpm" }
 openstack-keystone-federation-driver-sql = { version = "0.1", path = "crates/federation-driver-sql" }
 openstack-keystone-k8s-auth-driver-sql = { version = "0.1", path = "crates/k8s-auth-driver-sql/" }
@@ -154,7 +159,6 @@ openstack-keystone-limit-driver-sql = { version = "0.1", path = "crates/limit-dr
 openstack-keystone-k8s-auth-driver-raft = { version = "0.1", path = "crates/k8s-auth-driver-raft/" }
 openstack-keystone-key-repository = { version = "0.1.0", path = "crates/key-repository" }
 openstack-keystone-local-emergency-store = { version = "0.1.0", path = "crates/local-emergency-store" }
-openstack-keystone-metrics = { version = "0.1.0", path = "crates/metrics" }
 openstack-keystone-mapping-driver-raft = { version = "0.1", path = "crates/mapping-driver-raft/" }
 openstack-keystone-oauth2-client-driver-raft = { version = "0.1", path = "crates/oauth2-client-driver-raft/" }
 openstack-keystone-oauth2-key-driver-raft = { version = "0.1", path = "crates/oauth2-key-driver-raft/" }
@@ -216,6 +220,7 @@ tower = { version = "0.5" }
 tower-http = { version = "0.7" }
 tracing = { version = "0.1" }
 tracing-appender = { version = "0.2" }
+tracing-opentelemetry = { version = "0.34", default-features = false }
 tracing-journald = { version = "0.3" }
 tracing-subscriber = { version = "0.3" }
 tracing-test = { version = "0.2" }

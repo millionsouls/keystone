@@ -65,6 +65,8 @@
   - [LDAP Identity Backend](admin/features/ldap.md)
   - [Dynamic Authentication Plugins](admin/features/auth-plugins.md)
   - [Audit trail](admin/features/audit.md)
+  - [OpenTelemetry](admin/features/opentelemetry.md)
+  - [Observability](admin/features/observability.md)
 
 ---
 
@@ -85,6 +87,7 @@
 
 - [Contributor guide](contributor/index.md)
   - [Local development](contributor/development.md)
+  - [Observability stack](contributor/observability.md)
   - [Testing](contributor/testing.md)
   - [API development](contributor/api-development.md)
   - [Python API compatibility](contributor/python-compatibility.md)
@@ -133,3 +136,4 @@
     - [Application-Credential Access-Rule Enforcement](adr/0037-access-rule-enforcement.md)
     - [Unified Limits](adr/0038-unified-limits.md)
     - [Config Engine and Section Registry](adr/0039-config-engine-and-section-registry.md)
+    - [OpenTelemetry Telemetry Pipeline](adr/0040-opentelemetry.md)

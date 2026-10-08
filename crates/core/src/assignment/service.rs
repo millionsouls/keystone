@@ -564,6 +564,7 @@ impl AssignmentApi for AssignmentService {
     ///
     /// # Returns
     /// - `Result<bool, AssignmentProviderError>` - True if the grant exists.
+    #[tracing::instrument(name = "provider.assignment.check_grant", level = "debug", skip_all)]
     async fn check_grant<'a>(
         &self,
         ctx: &ExecutionContext<'a>,
@@ -585,6 +586,7 @@ impl AssignmentApi for AssignmentService {
     /// # Returns
     /// - `Result<Assignment, AssignmentProviderError>` - The created assignment
     ///   or an error.
+    #[tracing::instrument(name = "provider.assignment.create_grant", level = "debug", skip_all)]
     async fn create_grant<'a>(
         &self,
         ctx: &ExecutionContext<'a>,
@@ -711,6 +713,7 @@ impl AssignmentApi for AssignmentService {
     /// # Returns
     /// - `Result<Vec<Assignment>, AssignmentProviderError>` - A list of
     ///   assignments or an error.
+    #[tracing::instrument(name = "provider.assignment.list_role_assignments", level = "debug", skip_all, fields(params = ?params))]
     async fn list_role_assignments<'a>(
         &self,
         ctx: &ExecutionContext<'a>,
@@ -776,6 +779,7 @@ impl AssignmentApi for AssignmentService {
     ///
     /// # Returns
     /// - `Result<(), AssignmentProviderError>` - Ok on success, or an error.
+    #[tracing::instrument(name = "provider.assignment.revoke_grant", level = "debug", skip_all)]
     async fn revoke_grant<'a>(
         &self,
         ctx: &ExecutionContext<'a>,
@@ -880,21 +884,24 @@ impl AssignmentApi for AssignmentService {
             &grant.r#type,
             AssignmentType::UserDomain | AssignmentType::UserProject | AssignmentType::UserSystem
         ) {
-            // ADR 0034 §4: the central revocation event stays on the global revoke
-            // provider, unrouted — it is not an assignment-backend operation.
+            // ADR 0034 §4: the central revocation event stays on the global
+            // revoke provider, unrouted — it is not an
+            // assignment-backend operation.
             ctx.state()
                 .provider
                 .get_revoke_provider()
                 .create_revocation_event(ctx, revocation_event)
                 .await?;
             // ADR 0031 "Tokens": revoking a grant cascades revocation of every
-            // token carrying that role - `"cascade"`, not a direct user request.
-            crate::token::TOKEN_METRICS.revoked_total.inc(["cascade"]);
+            // token carrying that role - `"cascade"`, not a direct user
+            // request.
+            crate::token::TOKEN_METRICS.record_revoked("cascade");
         }
 
         Ok(())
     }
 
+    #[tracing::instrument(name = "provider.assignment.reload", level = "debug", skip_all)]
     async fn reload(&self, state: &ServiceState) -> Result<bool, AssignmentProviderError> {
         match self.rebuild(state).await {
             Ok(changed) => Ok(changed),
@@ -908,6 +915,11 @@ impl AssignmentApi for AssignmentService {
         }
     }
 
+    #[tracing::instrument(
+        name = "provider.assignment.refresh_bindings",
+        level = "debug",
+        skip_all
+    )]
     async fn refresh_bindings(&self, state: &ServiceState) -> Result<(), AssignmentProviderError> {
         if let Err(error) = self.rebuild(state).await {
             warn!(

@@ -99,6 +99,7 @@ impl RoleApi for RoleService {
     /// # Arguments
     /// * `state` - The current service state.
     /// * `params` - The parameters for creating a role.
+    #[tracing::instrument(name = "provider.role.create_role", level = "debug", skip_all)]
     async fn create_role<'a>(
         &self,
         ctx: &ExecutionContext<'a>,
@@ -156,6 +157,7 @@ impl RoleApi for RoleService {
     /// * `state` - The current service state.
     /// * `prior_role_id` - The ID of the prior role.
     /// * `implied_role_id` - The ID of the implied role.
+    #[tracing::instrument(name = "provider.role.create_role_imply_rule", level = "debug", skip_all, fields(prior_role_id = %prior_role_id, implied_role_id = %implied_role_id))]
     async fn create_role_imply_rule<'a>(
         &self,
         ctx: &ExecutionContext<'a>,
@@ -212,6 +214,7 @@ impl RoleApi for RoleService {
     /// * `state` - The current service state.
     /// * `prior_role_id` - The ID of the prior role.
     /// * `implied_role_id` - The ID of the implied role.
+    #[tracing::instrument(name = "provider.role.check_role_imply_rule", level = "debug", skip_all, fields(prior_role_id = %prior_role_id, implied_role_id = %implied_role_id))]
     async fn check_role_imply_rule<'a>(
         &self,
         ctx: &ExecutionContext<'a>,
@@ -229,6 +232,7 @@ impl RoleApi for RoleService {
     /// * `state` - The current service state.
     /// * `role_id` - The ID of the role to update.
     /// * `role` - The fields to change.
+    #[tracing::instrument(name = "provider.role.update_role", level = "debug", skip_all, fields(role_id = %role_id))]
     async fn update_role<'a>(
         &self,
         ctx: &ExecutionContext<'a>,
@@ -280,6 +284,7 @@ impl RoleApi for RoleService {
     /// # Arguments
     /// * `state` - The current service state.
     /// * `id` - The ID of the role to delete.
+    #[tracing::instrument(name = "provider.role.delete_role", level = "debug", skip_all, fields(id = %id))]
     async fn delete_role<'a>(
         &self,
         ctx: &ExecutionContext<'a>,
@@ -323,6 +328,7 @@ impl RoleApi for RoleService {
     /// * `state` - The current service state.
     /// * `prior_role_id` - The ID of the prior role.
     /// * `implied_role_id` - The ID of the implied role.
+    #[tracing::instrument(name = "provider.role.delete_role_imply_rule", level = "debug", skip_all, fields(prior_role_id = %prior_role_id, implied_role_id = %implied_role_id))]
     async fn delete_role_imply_rule<'a>(
         &self,
         ctx: &ExecutionContext<'a>,
@@ -376,6 +382,7 @@ impl RoleApi for RoleService {
     /// # Arguments
     /// * `state` - The current service state.
     /// * `roles` - The list of roles to expand.
+    #[tracing::instrument(name = "provider.role.expand_implied_roles", level = "debug", skip_all)]
     async fn expand_implied_roles<'a>(
         &self,
         ctx: &ExecutionContext<'a>,
@@ -397,6 +404,7 @@ impl RoleApi for RoleService {
     ///
     /// A `Result` containing an `Option` with the `Role` if found, or an
     /// `Error`.
+    #[tracing::instrument(name = "provider.role.get_role", level = "debug", skip_all, fields(id = %id))]
     async fn get_role<'a>(
         &self,
         ctx: &ExecutionContext<'a>,
@@ -418,6 +426,7 @@ impl RoleApi for RoleService {
     /// * `state` - The current service state.
     /// * `prior_role_id` - The ID of the prior role.
     /// * `implied_role_id` - The ID of the implied role.
+    #[tracing::instrument(name = "provider.role.get_role_imply_rule", level = "debug", skip_all, fields(prior_role_id = %prior_role_id, implied_role_id = %implied_role_id))]
     async fn get_role_imply_rule<'a>(
         &self,
         ctx: &ExecutionContext<'a>,
@@ -433,6 +442,11 @@ impl RoleApi for RoleService {
     ///
     /// # Arguments
     /// * `state` - The current service state.
+    #[tracing::instrument(
+        name = "provider.role.list_role_imply_rules",
+        level = "debug",
+        skip_all
+    )]
     async fn list_role_imply_rules<'a>(
         &self,
         ctx: &ExecutionContext<'a>,
@@ -445,6 +459,7 @@ impl RoleApi for RoleService {
     /// # Arguments
     /// * `state` - The current service state.
     /// * `prior_role_id` - The ID of the prior role.
+    #[tracing::instrument(name = "provider.role.list_role_imply_rules_by_prior", level = "trace", skip_all, fields(prior_role_id = %prior_role_id))]
     async fn list_role_imply_rules_by_prior<'a>(
         &self,
         ctx: &ExecutionContext<'a>,
@@ -463,11 +478,53 @@ impl RoleApi for RoleService {
         Ok(rules)
     }
 
+    /// List role imply rules for any of the given prior roles.
+    ///
+    /// Roles already in the request cache are served from it; the rest are
+    /// fetched with a single backend call and cached per role, including the
+    /// roles that have no rules.
+    ///
+    /// # Arguments
+    /// * `state` - The current service state.
+    /// * `prior_role_ids` - The IDs of the prior roles.
+    #[tracing::instrument(name = "provider.role.list_role_imply_rules_by_priors", level = "debug", skip_all, fields(count = prior_role_ids.len()))]
+    async fn list_role_imply_rules_by_priors<'a>(
+        &self,
+        ctx: &ExecutionContext<'a>,
+        prior_role_ids: &[&'a str],
+    ) -> Result<Vec<RoleImply>, RoleProviderError> {
+        let mut rules: Vec<RoleImply> = Vec::new();
+        let mut missing: Vec<&'a str> = Vec::new();
+        for id in prior_role_ids {
+            match cache_get::<Vec<RoleImply>>(ROLE_IMPLY_BY_PRIOR_CACHE_NS, id) {
+                Some(cached) => rules.extend(cached),
+                None => missing.push(id),
+            }
+        }
+        if !missing.is_empty() {
+            let fetched = self
+                .backend_driver
+                .list_role_imply_rules_by_priors(ctx.state(), &missing)
+                .await?;
+            for id in &missing {
+                let own: Vec<RoleImply> = fetched
+                    .iter()
+                    .filter(|rule| rule.prior_role.id == *id)
+                    .cloned()
+                    .collect();
+                cache_set(ROLE_IMPLY_BY_PRIOR_CACHE_NS, id, own);
+            }
+            rules.extend(fetched);
+        }
+        Ok(rules)
+    }
+
     /// List roles.
     ///
     /// # Arguments
     /// * `state` - The current service state.
     /// * `params` - The parameters for listing roles.
+    #[tracing::instrument(name = "provider.role.list_roles", level = "debug", skip_all, fields(params = ?params))]
     async fn list_roles<'a>(
         &self,
         ctx: &ExecutionContext<'a>,
@@ -751,6 +808,47 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(first, second);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_list_role_imply_rules_by_priors_one_backend_call_for_missing_only() {
+        let state = get_mocked_state(None, Some(Provider::mocked_builder())).await;
+        let mut backend = MockRoleBackend::default();
+        backend
+            .expect_list_role_imply_rules_by_priors()
+            .times(1)
+            .withf(|_, ids: &[&str]| ids == ["a", "b"])
+            .returning(|_, _| Ok(vec![make_imply("a", "x")]));
+        backend
+            .expect_list_role_imply_rules_by_priors()
+            .times(1)
+            .withf(|_, ids: &[&str]| ids == ["c"])
+            .returning(|_, _| Ok(vec![make_imply("c", "y")]));
+        let provider = RoleService {
+            backend_driver: Arc::new(backend),
+        };
+
+        crate::request_cache::RequestCache::scope(async {
+            let ctx = ExecutionContext::internal(&state);
+            let first = provider
+                .list_role_imply_rules_by_priors(&ctx, &["a", "b"])
+                .await
+                .unwrap();
+            assert_eq!(first, vec![make_imply("a", "x")]);
+            // "a" and "b" (which has no rules) are cached, only "c" is fetched.
+            let second = provider
+                .list_role_imply_rules_by_priors(&ctx, &["a", "b", "c"])
+                .await
+                .unwrap();
+            assert_eq!(second, vec![make_imply("a", "x"), make_imply("c", "y")]);
+            // The single-role lookup shares the cache.
+            let single = provider
+                .list_role_imply_rules_by_prior(&ctx, "c")
+                .await
+                .unwrap();
+            assert_eq!(single, vec![make_imply("c", "y")]);
         })
         .await;
     }

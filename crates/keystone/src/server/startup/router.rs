@@ -41,6 +41,7 @@ use super::Startup;
 use crate::server::access_log::log_request;
 use crate::server::error_log::log_error_body;
 use crate::server::http_metrics::{HttpMetrics, record_http_metrics};
+use crate::server::request_span::{RequestSpanOptions, options_from_config, server_span};
 use crate::server::{proxy_headers, request_cache};
 use crate::{common, scim, webauthn};
 use openstack_keystone_core::keystone::ServiceState;
@@ -87,7 +88,8 @@ pub async fn build(
     let state = &startup.state;
     let mut app = Router::new().merge(main_router.with_state(state.clone()));
     app = mount_extensions(app, startup).await?;
-    app = apply_middleware(app, state);
+    let span_options = options_from_config(&*state.config_manager.config.read().await);
+    app = apply_middleware(app, state, span_options);
     let (app, http_metrics) = attach_http_metrics(app, state).await;
     Ok((finalize(app, openapi), http_metrics))
 }
@@ -110,12 +112,18 @@ async fn mount_extensions(mut app: Router, startup: &Startup) -> Result<Router, 
 
 /// Build and apply the shared request/response middleware stack (request-id
 /// minting, per-request cache scope, body limit, tracing span, access/error
-/// logging, compression, request-id propagation).
+/// logging, compression, request-id propagation). When traces are exported
+/// (`span_options` is `Some`) the OpenTelemetry server span wraps everything
+/// below `TraceLayer`.
 ///
 /// The `ServiceBuilder` runs top-to-bottom; it stays a local rather than a
 /// named return type because the composed tower type is effectively
 /// unwriteable.
-fn apply_middleware(app: Router, state: &ServiceState) -> Router {
+fn apply_middleware(
+    app: Router,
+    state: &ServiceState,
+    span_options: Option<Arc<RequestSpanOptions>>,
+) -> Router {
     let x_request_id = HeaderName::from_static("x-openstack-request-id");
     let sensitive_headers: Arc<[_]> = vec![
         header::AUTHORIZATION,
@@ -178,6 +186,12 @@ fn apply_middleware(app: Router, state: &ServiceState) -> Router {
                 // Finish-of-request logging is done by `log_request` below.
                 .on_response(()),
         )
+        // The OpenTelemetry `http.server` span (ADR 0040): only when traces
+        // are exported, inside `TraceLayer` so it is a child of the
+        // log-only `request` span, and before anything that does the work.
+        .option_layer(
+            span_options.map(|options| middleware::from_fn_with_state(options, server_span)),
+        )
         // One INFO line per request with method/uri/request-id/status/
         // latency folded into the message text. Must stay after TraceLayer
         // so it runs inside the request span.
@@ -195,7 +209,8 @@ fn apply_middleware(app: Router, state: &ServiceState) -> Router {
 
 /// Add the request-count/latency metrics layer when
 /// `[interface_metrics] http_requests_enabled` is set, returning the shared
-/// [`HttpMetrics`] handle so the `/metrics` scrape handler can render it.
+/// [`HttpMetrics`] handle for the metrics listener, which wraps its own routes
+/// with it.
 async fn attach_http_metrics(
     mut app: Router,
     state: &ServiceState,
@@ -210,7 +225,9 @@ async fn attach_http_metrics(
     {
         return (app, None);
     }
-    let http_metrics = Arc::new(HttpMetrics::new());
+    let http_metrics = Arc::new(HttpMetrics::new(
+        &openstack_keystone_telemetry::metrics::meter(),
+    ));
     // `Router::layer()` applies in reverse call order (last-added is
     // outermost) — `Extension` must be added *after* `from_fn` so it runs
     // first and the extractor inside `record_http_metrics` has something to

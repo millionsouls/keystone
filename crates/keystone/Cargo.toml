@@ -64,7 +64,6 @@ openstack-keystone-oauth2-client-driver-raft.workspace = true
 openstack-keystone-oauth2-key-driver-raft.workspace = true
 openstack-keystone-oauth2-session-driver-raft.workspace = true
 openstack-keystone-key-repository.workspace = true
-openstack-keystone-metrics.workspace = true
 openstack-keystone-identity-driver-ldap.workspace = true
 openstack-keystone-identity-driver-sql.workspace = true
 openstack-keystone-idmapping-driver-sql.workspace = true
@@ -75,6 +74,7 @@ openstack-keystone-revoke-driver-sql.workspace = true
 openstack-keystone-role-driver-sql.workspace = true
 openstack-keystone-scim-driver-raft.workspace = true
 openstack-keystone-token-driver-fernet.workspace = true
+openstack-keystone-telemetry.workspace = true
 openstack-keystone-token-driver-jws.workspace = true
 openstack-keystone-token-restriction-driver-sql.workspace = true
 openstack-keystone-trust-driver-sql.workspace = true
@@ -115,6 +115,7 @@ validator = { workspace = true, features = ["derive"] }
 toml = { version = "1.1", default-features = false, features = ["parse", "serde"] }
 
 [dev-dependencies]
+openstack-keystone-telemetry = { workspace = true, features = ["golden"] }
 rcgen.workspace = true
 http-body-util.workspace = true
 httpmock = { version = "0.8", features = ["http2"] }
@@ -134,6 +135,10 @@ default = []
 openfga = ["dep:openstack-keystone-assignment-driver-openfga"]
 # RFC 5424 syslog audit sink (`[audit] sink = { type = "syslog", .. }`).
 audit-syslog = ["cadf/syslog"]
+# OTLP trace and metric export (`[otel]`, ADR 0040), over OTLP/HTTP.
+otel = ["openstack-keystone-telemetry/otel"]
+# Adds the OTLP/gRPC transport (`[otel] protocol = grpc`); use with `otel`.
+otlp-grpc = ["openstack-keystone-telemetry/otlp-grpc"]
 
 [lints]
 workspace = true
