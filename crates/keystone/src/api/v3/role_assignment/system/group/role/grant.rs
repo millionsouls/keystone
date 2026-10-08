@@ -12,7 +12,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! System user role: put.
+//! System group role: put.
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -29,68 +29,71 @@ use crate::api::v3::role_assignment::system::policy_target;
 use crate::keystone::ServiceState;
 use openstack_keystone_core::auth::ExecutionContext;
 
-/// Assign role to user on system
+/// Assign role to group on system
 ///
-/// Assigns a role to a user on the system.
+/// Assigns a role to a group on the system.
 #[utoipa::path(
     put,
-    path = "/system/users/{user_id}/roles/{role_id}",
-    operation_id = "/system/user/role:put",
+    path = "/system/groups/{group_id}/roles/{role_id}",
+    operation_id = "/system/group/role:put",
     params(
         ("role_id" = String, Path, description = "The role ID."),
-        ("user_id" = String, Path, description = "The user ID.")
+        ("group_id" = String, Path, description = "The group ID.")
     ),
     responses(
         (status = NO_CONTENT, description = "Grant is created."),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
         (status = 404, description = "Grant not found", example = json!(KeystoneApiError::NotFound(String::from("id = 1"))))
     ),
     security(("x-auth" = [])),
     tag="role_assignments"
 )]
 #[tracing::instrument(
-    name = "api::v3::system_user_role_grant",
+    name = "api::v3::system_group_role_grant",
     level = "debug",
     skip(state, user_auth),
     err(Debug)
 )]
 pub(super) async fn grant(
     Auth(user_auth): Auth,
-    Path((user_id, role_id)): Path<(String, String)>,
+    Path((group_id, role_id)): Path<(String, String)>,
     State(state): State<ServiceState>,
 ) -> Result<impl IntoResponse, KeystoneApiError> {
     let exec = &ExecutionContext::from_auth(&state, &user_auth);
-    let (user, role) = tokio::join!(
+
+    let (group, role) = tokio::join!(
         state
             .provider
             .get_identity_provider()
-            .get_user(exec, &user_id),
+            .get_group(exec, &group_id),
         state.provider.get_role_provider().get_role(exec, &role_id),
     );
-    let user = user?;
+    let group = group?;
     let role = role?;
 
     state
         .policy_enforcer
         .enforce(
-            "identity/system/user/role/grant",
+            "identity/system/group/role/grant",
             &user_auth,
-            json!({"user": policy_target(&user, &user_id), "role": policy_target(&role, &role_id)}),
+            json!({"group": policy_target(&group, &group_id), "role": policy_target(&role, &role_id)}),
             None,
         )
         .await?;
 
-    let user = user.ok_or_else(|| {
-        info!("User {} was not found", user_id);
+    let group = group.ok_or_else(|| {
+        info!("Group {} was not found", group_id);
         KeystoneApiError::NotFound {
-            resource: "grant".into(),
-            identifier: "".into(),
+            resource: "group".into(),
+            identifier: group_id.clone(),
         }
     })?;
     let role = role.ok_or_else(|| {
         info!("Role {} was not found", role_id);
         KeystoneApiError::NotFound {
-            resource: "grant".into(),
-            identifier: "".into(),
+            resource: "role".into(),
+            identifier: role_id.clone(),
         }
     })?;
 
@@ -99,7 +102,7 @@ pub(super) async fn grant(
         .get_assignment_provider()
         .create_grant(
             exec,
-            AssignmentCreate::user_system(user.id, "system", role.id, false),
+            AssignmentCreate::group_system(group.id, "system", role.id, false),
         )
         .await?;
 
@@ -117,10 +120,12 @@ mod tests {
     use tracing_test::traced_test;
 
     use openstack_keystone_core_types::assignment::*;
-    use openstack_keystone_core_types::identity::*;
+    use openstack_keystone_core_types::identity::GroupBuilder as CoreGroupBuilder;
     use openstack_keystone_core_types::role::*;
 
-    use crate::api::tests::{get_mocked_state, test_fixture_scoped};
+    use crate::api::tests::{
+        get_capturing_state, get_mocked_state, policy_contract, test_fixture_scoped,
+    };
     use crate::api::v3::role_assignment::openapi_router;
     use crate::assignment::MockAssignmentProvider;
     use crate::identity::MockIdentityProvider;
@@ -132,40 +137,41 @@ mod tests {
     async fn test_all_found_allowed() {
         let mut identity_mock = MockIdentityProvider::default();
         identity_mock
-            .expect_get_user()
-            .withf(|_, id: &'_ str| id == "user_id")
+            .expect_get_group()
+            .withf(|_, id: &'_ str| id == "group_id")
             .returning(|_, _| {
                 Ok(Some(
-                    UserResponseBuilder::default()
-                        .id("user_id")
-                        .domain_id("user_domain_id")
-                        .enabled(true)
+                    CoreGroupBuilder::default()
+                        .id("group_id")
+                        .domain_id("group_domain_id")
                         .name("name")
                         .build()
                         .unwrap(),
                 ))
             });
+
         let mut assignment_mock = MockAssignmentProvider::default();
         assignment_mock
             .expect_create_grant()
             .withf(|_, params: &AssignmentCreate| {
                 params.role_id == "role_id"
-                    && params.actor_id == "user_id"
+                    && params.actor_id == "group_id"
                     && params.target_id == "system"
-                    && params.r#type == AssignmentType::UserSystem
+                    && params.r#type == AssignmentType::GroupSystem
                     && !params.inherited
             })
             .returning(|_, _| {
                 Ok(Assignment {
                     role_id: "role_id".into(),
                     role_name: Some("rn".into()),
-                    actor_id: "user_id".into(),
+                    actor_id: "group_id".into(),
                     target_id: "system".into(),
-                    r#type: AssignmentType::UserSystem,
+                    r#type: AssignmentType::GroupSystem,
                     inherited: false,
                     implied_via: None,
                 })
             });
+
         let mut role_mock = MockRoleProvider::default();
         role_mock
             .expect_get_role()
@@ -185,7 +191,7 @@ mod tests {
             .mock_identity(identity_mock)
             .mock_role(role_mock);
         let vsc = test_fixture_scoped();
-        let state = get_mocked_state(provider_builder, true, None).await;
+        let (state, policy) = get_capturing_state(provider_builder).await;
         let mut api = openapi_router()
             .layer(TraceLayer::new_for_http())
             .with_state(state.clone());
@@ -195,7 +201,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("PUT")
-                    .uri("/system/users/user_id/roles/role_id")
+                    .uri("/system/groups/group_id/roles/role_id")
                     .extension(vsc)
                     .body(Body::empty())
                     .unwrap(),
@@ -204,6 +210,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let calls = policy.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].policy_name, "identity/system/group/role/grant");
+        policy_contract::assert_object_keys(&calls[0].target, &["group", "role"]);
+        policy_contract::assert_no_secrets(&calls[0].target);
+        policy_contract::assert_existing_presence(&calls[0].existing, false);
     }
 
     #[tokio::test]
@@ -211,19 +224,19 @@ mod tests {
     async fn test_all_found_not_allowed() {
         let mut identity_mock = MockIdentityProvider::default();
         identity_mock
-            .expect_get_user()
-            .withf(|_, id: &'_ str| id == "user_id")
+            .expect_get_group()
+            .withf(|_, id: &'_ str| id == "group_id")
             .returning(|_, _| {
                 Ok(Some(
-                    UserResponseBuilder::default()
-                        .id("user_id")
-                        .domain_id("user_domain_id")
-                        .enabled(true)
+                    CoreGroupBuilder::default()
+                        .id("group_id")
+                        .domain_id("group_domain_id")
                         .name("name")
                         .build()
                         .unwrap(),
                 ))
             });
+
         let mut role_mock = MockRoleProvider::default();
         role_mock
             .expect_get_role()
@@ -252,7 +265,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("PUT")
-                    .uri("/system/users/user_id/roles/role_id")
+                    .uri("/system/groups/group_id/roles/role_id")
                     .extension(vsc)
                     .body(Body::empty())
                     .unwrap(),
@@ -265,12 +278,13 @@ mod tests {
 
     #[tokio::test]
     #[traced_test]
-    async fn test_user_not_found_allowed() {
+    async fn test_group_not_found_allowed() {
         let mut identity_mock = MockIdentityProvider::default();
         identity_mock
-            .expect_get_user()
-            .withf(|_, id: &'_ str| id == "user_id")
+            .expect_get_group()
+            .withf(|_, id: &'_ str| id == "group_id")
             .returning(|_, _| Ok(None));
+
         let mut role_mock = MockRoleProvider::default();
         role_mock
             .expect_get_role()
@@ -299,7 +313,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("PUT")
-                    .uri("/system/users/user_id/roles/role_id")
+                    .uri("/system/groups/group_id/roles/role_id")
                     .extension(vsc)
                     .body(Body::empty())
                     .unwrap(),
@@ -314,19 +328,19 @@ mod tests {
     async fn test_role_not_found() {
         let mut identity_mock = MockIdentityProvider::default();
         identity_mock
-            .expect_get_user()
-            .withf(|_, id: &'_ str| id == "user_id")
+            .expect_get_group()
+            .withf(|_, id: &'_ str| id == "group_id")
             .returning(|_, _| {
                 Ok(Some(
-                    UserResponseBuilder::default()
-                        .id("user_id")
-                        .domain_id("user_domain_id")
-                        .enabled(true)
+                    CoreGroupBuilder::default()
+                        .id("group_id")
+                        .domain_id("group_domain_id")
                         .name("name")
                         .build()
                         .unwrap(),
                 ))
             });
+
         let mut role_mock = MockRoleProvider::default();
         role_mock
             .expect_get_role()
@@ -347,7 +361,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("PUT")
-                    .uri("/system/users/user_id/roles/role_id")
+                    .uri("/system/groups/group_id/roles/role_id")
                     .extension(vsc)
                     .body(Body::empty())
                     .unwrap(),

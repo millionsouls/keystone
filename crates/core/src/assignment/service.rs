@@ -522,8 +522,60 @@ impl AssignmentService {
     }
 }
 
+/// Create a grant, treating an already existing identical grant as success.
+///
+/// Granting a role is idempotent in Python Keystone (`PUT` answers 204 when
+/// the assignment is already present). A backend reports the duplicate as a
+/// conflict; it is only swallowed when the very same grant really exists, so
+/// that other conflicts are still reported.
+async fn create_grant_idempotent(
+    backend: &dyn AssignmentBackend,
+    state: &ServiceState,
+    grant: AssignmentCreate,
+) -> Result<Assignment, AssignmentProviderError> {
+    match backend.create_grant(state, grant.clone()).await {
+        Err(AssignmentProviderError::Conflict(msg)) => {
+            let existing = Assignment {
+                actor_id: grant.actor_id,
+                role_id: grant.role_id,
+                role_name: grant.role_name,
+                target_id: grant.target_id,
+                r#type: grant.r#type,
+                inherited: grant.inherited,
+                implied_via: None,
+            };
+            if backend.check_grant(state, &existing).await? {
+                Ok(existing)
+            } else {
+                Err(AssignmentProviderError::Conflict(msg))
+            }
+        }
+        other => other,
+    }
+}
+
 #[async_trait]
 impl AssignmentApi for AssignmentService {
+    /// Check whether the grant exists.
+    ///
+    /// # Parameters
+    /// - `ctx`: The execution context.
+    /// - `grant`: The assignment to check.
+    ///
+    /// # Returns
+    /// - `Result<bool, AssignmentProviderError>` - True if the grant exists.
+    async fn check_grant<'a>(
+        &self,
+        ctx: &ExecutionContext<'a>,
+        grant: &Assignment,
+    ) -> Result<bool, AssignmentProviderError> {
+        let bundle = self.bundle.load_full();
+        let backend_driver = self
+            .driver_for_target(ctx, &bundle, target_kind(&grant.r#type), &grant.target_id)
+            .await?;
+        backend_driver.check_grant(ctx.state(), grant).await
+    }
+
     /// Create assignment grant.
     ///
     /// # Parameters
@@ -590,12 +642,13 @@ impl AssignmentApi for AssignmentService {
                     },
                 ),
                 operation: async {
-                    backend_driver.create_grant(ctx.state(), grant_clone).await
+                    create_grant_idempotent(backend_driver.as_ref(), ctx.state(), grant_clone).await
                 },
                 on_audit_error: |_: AuditDispatchError| AssignmentProviderError::Driver("audit dispatch failed".into()),
             }?
         } else {
-            let assignment = backend_driver.create_grant(ctx.state(), grant).await?;
+            let assignment =
+                create_grant_idempotent(backend_driver.as_ref(), ctx.state(), grant).await?;
             ctx.state()
                 .event_dispatcher
                 .emit(Event::new(
@@ -818,17 +871,26 @@ impl AssignmentApi for AssignmentService {
             audit_chain_id: None,
             revoked_at: chrono::Utc::now(),
         };
-
-        // ADR 0034 §4: the central revocation event stays on the global revoke
-        // provider, unrouted — it is not an assignment-backend operation.
-        ctx.state()
-            .provider
-            .get_revoke_provider()
-            .create_revocation_event(ctx, revocation_event)
-            .await?;
-        // ADR 0031 "Tokens": revoking a grant cascades revocation of every
-        // token carrying that role - `"cascade"`, not a direct user request.
-        crate::token::TOKEN_METRICS.revoked_total.inc(["cascade"]);
+        // A revocation event cannot be bound to the members of a group: it
+        // would revoke every token carrying the role on that scope, including
+        // those of users holding the role through a direct assignment (Python
+        // Keystone bug #1662514). Effective roles are recalculated on every
+        // token validation, so members lose a revoked group role without it.
+        if matches!(
+            &grant.r#type,
+            AssignmentType::UserDomain | AssignmentType::UserProject | AssignmentType::UserSystem
+        ) {
+            // ADR 0034 §4: the central revocation event stays on the global revoke
+            // provider, unrouted — it is not an assignment-backend operation.
+            ctx.state()
+                .provider
+                .get_revoke_provider()
+                .create_revocation_event(ctx, revocation_event)
+                .await?;
+            // ADR 0031 "Tokens": revoking a grant cascades revocation of every
+            // token carrying that role - `"cascade"`, not a direct user request.
+            crate::token::TOKEN_METRICS.revoked_total.inc(["cascade"]);
+        }
 
         Ok(())
     }

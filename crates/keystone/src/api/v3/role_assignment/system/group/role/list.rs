@@ -12,7 +12,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! System user role: list.
+//! System group role: list.
 use axum::{
     Json,
     extract::{Path, State},
@@ -32,81 +32,82 @@ use crate::api::v3::role_assignment::system::policy_target;
 use crate::keystone::ServiceState;
 use openstack_keystone_core::auth::ExecutionContext;
 
-/// List the roles that a user has on the system.
+/// List the roles that a group has on the system.
 #[utoipa::path(
     get,
-    path = "/system/users/{user_id}/roles",
-    operation_id = "/system/user/role:list",
+    path = "/system/groups/{group_id}/roles",
+    operation_id = "/system/group/role:list",
     params(
-      ("user_id" = String, Path, description = "The user ID.")
+      ("group_id" = String, Path, description = "The group ID.")
     ),
     responses(
         (status = OK, description = "List of roles", example = json!([])),
-        (status = 404, description = "User not found", example = json!(KeystoneApiError::NotFound(String::from("id = 1"))))
+        (status = 404, description = "Group not found", example = json!(KeystoneApiError::NotFound(String::from("id = 1"))))
     ),
     security(("x-auth" = [])),
     tag="role_assignments"
 )]
 #[tracing::instrument(
-    name = "api::system_user_role_list",
+    name = "api::v3::system_group_role_list",
     level = "debug",
     skip(state, user_auth),
     err(Debug)
 )]
 pub(super) async fn list(
     Auth(user_auth): Auth,
-    Path(user_id): Path<String>,
+    Path(group_id): Path<String>,
     State(state): State<ServiceState>,
 ) -> Result<impl IntoResponse, KeystoneApiError> {
     let query_params = RoleAssignmentListParameters {
-        user_id: Some(user_id.clone()),
+        group_id: Some(group_id.clone()),
         system_id: Some("system".into()),
         effective: Some(false),
         include_names: Some(false),
         resolve_implied_roles: false,
         ..Default::default()
     };
-
     let exec = &ExecutionContext::from_auth(&state, &user_auth);
-    let (user, assignments) = tokio::join!(
+
+    let (group, assignments) = tokio::join!(
         state
             .provider
             .get_identity_provider()
-            .get_user(exec, &user_id),
+            .get_group(exec, &group_id),
         state
             .provider
             .get_assignment_provider()
             .list_role_assignments(exec, &query_params)
     );
-    let user = user?;
+    let group = group?;
 
     state
         .policy_enforcer
         .enforce(
-            "identity/system/user/role/list",
+            "identity/system/group/role/list",
             &user_auth,
-            json!({"user": policy_target(&user, &user_id)}),
+            json!({"group": policy_target(&group, &group_id)}),
             None,
         )
         .await?;
 
-    user.ok_or_else(|| {
-        info!("User {} was not found", user_id);
+    group.ok_or_else(|| {
+        info!("Group {} was not found", group_id);
         KeystoneApiError::NotFound {
-            resource: "grant".into(),
-            identifier: "".into(),
+            resource: "group".into(),
+            identifier: group_id.clone(),
         }
     })?;
 
     let assignments = assignments?;
-    // Collect to HashSet<Role> to deduplicate, then convert to Vec for API
-    // response
-    let roles: Vec<Role> = assignments
+    // Collect to HashSet<Role> to deduplicate, then sort by id for a stable
+    // response order.
+    let mut roles: Vec<Role> = assignments
         .into_iter()
         .map(|a| a.try_into())
         .collect::<Result<std::collections::HashSet<_>, _>>()?
         .into_iter()
         .collect();
+    roles.sort_by(|a, b| a.id.cmp(&b.id));
 
     Ok((StatusCode::OK, Json(RoleAssignmentRoleList { roles })).into_response())
 }
@@ -124,24 +125,25 @@ mod tests {
     use openstack_keystone_api_types::v3::role_assignment::RoleAssignmentRoleList;
     use openstack_keystone_core_types::assignment::RoleAssignmentListParameters;
     use openstack_keystone_core_types::assignment::{Assignment, AssignmentType};
-    use openstack_keystone_core_types::identity::*;
+    use openstack_keystone_core_types::identity::GroupBuilder as CoreGroupBuilder;
 
-    use crate::api::tests::{get_mocked_state, test_fixture_scoped};
+    use crate::api::tests::{
+        get_capturing_state, get_mocked_state, policy_contract, test_fixture_scoped,
+    };
     use crate::api::v3::role_assignment::openapi_router;
     use crate::assignment::MockAssignmentProvider;
     use crate::identity::MockIdentityProvider;
     use crate::provider::Provider;
 
-    fn user_mock(mock: &mut MockIdentityProvider) {
-        mock.expect_get_user()
-            .withf(|_, id: &'_ str| id == "user_id")
+    fn group_mock(mock: &mut MockIdentityProvider) {
+        mock.expect_get_group()
+            .withf(|_, id: &'_ str| id == "group_id")
             .returning(|_, _| {
                 Ok(Some(
-                    UserResponseBuilder::default()
-                        .id("user_id")
+                    CoreGroupBuilder::default()
+                        .id("group_id")
                         .domain_id("domain_id")
-                        .enabled(true)
-                        .name("uname")
+                        .name("gname")
                         .build()
                         .unwrap(),
                 ))
@@ -151,7 +153,7 @@ mod tests {
     fn assignment_mock_empty(mock: &mut MockAssignmentProvider) {
         mock.expect_list_role_assignments()
             .withf(|_, params: &RoleAssignmentListParameters| {
-                params.user_id.as_deref() == Some("user_id")
+                params.group_id.as_deref() == Some("group_id")
                     && params.system_id.as_deref() == Some("system")
                     && params.effective == Some(false)
                     && params.include_names == Some(false)
@@ -164,15 +166,13 @@ mod tests {
         let mut identity_mock = MockIdentityProvider::default();
         let mut assignment_mock = MockAssignmentProvider::default();
 
-        user_mock(&mut identity_mock);
+        group_mock(&mut identity_mock);
         assignment_mock_empty(&mut assignment_mock);
 
-        let state = get_mocked_state(
+        let (state, policy) = get_capturing_state(
             Provider::mocked_builder()
                 .mock_identity(identity_mock)
                 .mock_assignment(assignment_mock),
-            true,
-            None,
         )
         .await;
 
@@ -185,7 +185,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/system/users/user_id/roles")
+                    .uri("/system/groups/group_id/roles")
                     .extension(vsc)
                     .body(Body::empty())
                     .unwrap(),
@@ -194,6 +194,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+
+        let calls = policy.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].policy_name, "identity/system/group/role/list");
+        policy_contract::assert_object_keys(&calls[0].target, &["group"]);
+        policy_contract::assert_no_secrets(&calls[0].target);
+        policy_contract::assert_existing_presence(&calls[0].existing, false);
     }
 
     #[tokio::test]
@@ -201,7 +208,7 @@ mod tests {
         let mut identity_mock = MockIdentityProvider::default();
         let mut assignment_mock = MockAssignmentProvider::default();
 
-        user_mock(&mut identity_mock);
+        group_mock(&mut identity_mock);
         assignment_mock_empty(&mut assignment_mock);
 
         let state = get_mocked_state(
@@ -222,7 +229,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/system/users/user_id/roles")
+                    .uri("/system/groups/group_id/roles")
                     .extension(vsc)
                     .body(Body::empty())
                     .unwrap(),
@@ -244,7 +251,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/system/users/user_id/roles")
+                    .uri("/system/groups/group_id/roles")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -256,11 +263,11 @@ mod tests {
 
     #[tokio::test]
     #[traced_test]
-    async fn test_list_user_not_found() {
+    async fn test_list_group_not_found() {
         let mut identity_mock = MockIdentityProvider::default();
         identity_mock
-            .expect_get_user()
-            .withf(|_, id: &'_ str| id == "user_id")
+            .expect_get_group()
+            .withf(|_, id: &'_ str| id == "group_id")
             .returning(|_, _| Ok(None));
 
         let mut assignment_mock = MockAssignmentProvider::default();
@@ -284,7 +291,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/system/users/user_id/roles")
+                    .uri("/system/groups/group_id/roles")
                     .extension(vsc)
                     .body(Body::empty())
                     .unwrap(),
@@ -300,11 +307,11 @@ mod tests {
         let mut identity_mock = MockIdentityProvider::default();
         let mut assignment_mock = MockAssignmentProvider::default();
 
-        user_mock(&mut identity_mock);
+        group_mock(&mut identity_mock);
         assignment_mock
             .expect_list_role_assignments()
             .withf(|_, params: &RoleAssignmentListParameters| {
-                params.user_id.as_deref() == Some("user_id")
+                params.group_id.as_deref() == Some("group_id")
                     && params.system_id.as_deref() == Some("system")
                     && params.effective == Some(false)
                     && params.include_names == Some(false)
@@ -314,36 +321,36 @@ mod tests {
                     Assignment {
                         role_id: "role1".into(),
                         role_name: Some("Role1".into()),
-                        actor_id: "user_id".into(),
+                        actor_id: "group_id".into(),
                         target_id: "system".into(),
-                        r#type: AssignmentType::UserSystem,
+                        r#type: AssignmentType::GroupSystem,
                         inherited: false,
                         implied_via: None,
                     },
                     Assignment {
                         role_id: "role1".into(),
                         role_name: Some("Role1".into()),
-                        actor_id: "user_id".into(),
+                        actor_id: "group_id".into(),
                         target_id: "system".into(),
-                        r#type: AssignmentType::UserSystem,
+                        r#type: AssignmentType::GroupSystem,
                         inherited: false,
                         implied_via: Some("imply_rule_1".into()),
                     },
                     Assignment {
                         role_id: "role1".into(),
                         role_name: Some("Role1".into()),
-                        actor_id: "user_id".into(),
+                        actor_id: "group_id".into(),
                         target_id: "system".into(),
-                        r#type: AssignmentType::UserSystem,
+                        r#type: AssignmentType::GroupSystem,
                         inherited: false,
                         implied_via: Some("imply_rule_2".into()),
                     },
                     Assignment {
                         role_id: "role2".into(),
                         role_name: Some("Role2".into()),
-                        actor_id: "user_id".into(),
+                        actor_id: "group_id".into(),
                         target_id: "system".into(),
-                        r#type: AssignmentType::UserSystem,
+                        r#type: AssignmentType::GroupSystem,
                         inherited: false,
                         implied_via: None,
                     },
@@ -368,7 +375,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/system/users/user_id/roles")
+                    .uri("/system/groups/group_id/roles")
                     .extension(vsc)
                     .body(Body::empty())
                     .unwrap(),
@@ -382,7 +389,6 @@ mod tests {
         let bytes = axum::body::to_bytes(body, 1024 * 1024).await.unwrap();
         let res: RoleAssignmentRoleList = serde_json::from_slice(&bytes).unwrap();
 
-        // 4 assignments but only 2 unique roles
         assert_eq!(res.roles.len(), 2);
         let role_ids: Vec<_> = res.roles.iter().map(|r| &r.id).collect();
         assert!(role_ids.contains(&&"role1".to_string()));
