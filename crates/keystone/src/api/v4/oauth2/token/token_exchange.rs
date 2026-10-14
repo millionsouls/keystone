@@ -246,6 +246,43 @@ mod tests {
         }
     }
 
+    async fn exchange_with_app_cred_expiries(
+        subject_expires_at: chrono::DateTime<chrono::Utc>,
+        app_cred_expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> axum::response::Response {
+        let client = token_exchange_client().await;
+        let mut client_mock = MockOauth2ClientProvider::default();
+        client_mock
+            .expect_get_by_client_id()
+            .returning(move |_, _| Ok(Some(client.clone())));
+
+        let mut token_mock = crate::token::MockTokenProvider::default();
+        token_mock
+            .expect_validate_to_context()
+            .returning(move |_, _, _, _| {
+                Ok(app_cred_delegated_vsc(
+                    subject_expires_at,
+                    app_cred_expires_at,
+                ))
+            });
+
+        let provider = Provider::mocked_builder()
+            .mock_oauth2_client(client_mock)
+            .mock_token(token_mock)
+            .mock_oauth2_key(ok_key_mock());
+        let state = get_mocked_state(provider, true, None).await;
+        let mut api = openapi_router()
+            .layer(TraceLayer::new_for_http())
+            .with_state(state);
+
+        api.as_service()
+            .oneshot(request(
+                "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange&client_id=client-1&client_secret=s3cr3t&subject_token=some-existing-token",
+            ))
+            .await
+            .unwrap()
+    }
+
     fn trust_delegated_vsc() -> openstack_keystone_core::auth::ValidatedSecurityContext {
         use openstack_keystone_core_types::identity::UserResponseBuilder;
         use openstack_keystone_core_types::resource::{Domain, Project};
@@ -671,5 +708,47 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(json_body(response).await["error"], "invalid_grant");
+    }
+
+    #[tokio::test]
+    async fn test_token_exchange_rejects_already_expired_app_cred() {
+        let now = chrono::Utc::now();
+        let response = exchange_with_app_cred_expiries(
+            now + chrono::Duration::seconds(300),
+            now - chrono::Duration::seconds(60),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert_eq!(body["error"], "invalid_grant");
+    }
+
+    #[tokio::test]
+    async fn test_token_exchange_rejects_app_cred_expiring_now() {
+        // The handler takes its own `now` after this one, so an expiry equal
+        // to this `now` always leaves a lifetime <= 0.
+        let now = chrono::Utc::now();
+        let response =
+            exchange_with_app_cred_expiries(now + chrono::Duration::seconds(300), now).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert_eq!(body["error"], "invalid_grant");
+    }
+
+    #[tokio::test]
+    async fn test_token_exchange_rejects_expired_subject_token() {
+        // Still-valid app credential; the subject token expiry is the limit.
+        let now = chrono::Utc::now();
+        let response = exchange_with_app_cred_expiries(
+            now - chrono::Duration::seconds(60),
+            now + chrono::Duration::seconds(300),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert_eq!(body["error"], "invalid_grant");
     }
 }
