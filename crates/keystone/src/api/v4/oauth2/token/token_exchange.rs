@@ -114,20 +114,31 @@ pub(super) async fn handle_token_exchange_grant(
         audience,
     )
     .map_err(|e| {
-        tracing::warn!(error = %e, "oauth2 token exchange claim construction failed");
+        use openstack_keystone_core::oauth2_client::TokenExchangeError;
+
         match e {
-            openstack_keystone_core::oauth2_client::TokenExchangeError::CrossDomainSubjectToken => {
+            TokenExchangeError::CrossDomainSubjectToken => {
+                tracing::warn!(error = %e, "subject_token's scope belongs to a different domain than this token endpoint");
                 Oauth2TokenError::invalid_grant(
                     "subject_token's scope belongs to a different domain than this token endpoint",
                 )
             }
-            openstack_keystone_core::oauth2_client::TokenExchangeError::MissingSubjectTokenExpiry
-            | openstack_keystone_core::oauth2_client::TokenExchangeError::NonPositiveLifetime => {
+            TokenExchangeError::MissingSubjectTokenExpiry => {
+                tracing::warn!(error = %e, "subject_token is missing an expiry claim");
+                Oauth2TokenError::invalid_grant(
+                    "subject_token is missing an expiry claim, cannot be exchanged",
+                )
+            }
+            TokenExchangeError::NonPositiveLifetime => {
+                tracing::warn!(error = %e, "subject_token or application credential expiry does not permit token exchange");
                 Oauth2TokenError::invalid_grant(
                     "subject_token or application credential expiry does not permit token exchange",
                 )
             }
-            _ => Oauth2TokenError::internal("token issuance failed"),
+            _ => {
+                tracing::error!(error = %e, "unexpected error occurred during token exchange");
+                Oauth2TokenError::internal("token issuance failed")
+            }
         }
     })?;
     let access_token = sign_jwt(state, domain_id, &claims).await?;
