@@ -85,7 +85,7 @@ pub(super) async fn handle_token_exchange_grant(
         ));
     }
 
-    let (vsc, delegation_context) =
+    let (vsc, delegation_context, credential_expires_at) =
         openstack_keystone_core::oauth2_client::validate_subject_token(state, &subject_token)
             .await
             .map_err(|e| {
@@ -107,6 +107,7 @@ pub(super) async fn handle_token_exchange_grant(
         &client,
         &vsc,
         delegation_context,
+        credential_expires_at,
         &issuer,
         jti,
         now,
