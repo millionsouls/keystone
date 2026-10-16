@@ -62,8 +62,9 @@ pub enum TokenExchangeError {
     MissingSubjectTokenExpiry,
 
     /// The credential-chain expiry is not later than the new token's issue time.
+    /// Subject token/ App Cred has either already expired or expires at/before the new token's issue time
     #[error("credential-chain expiry does not leave a positive token lifetime")]
-    NonPositiveLifetime,
+    CredentialChainExpired,
 
     /// The delegation object (app-cred) has no bound project. Exchange requires
     /// a concrete I2 boundary to enforce; there is nothing to bind the new
@@ -210,7 +211,7 @@ pub fn build_token_exchange_claims(
         exp = exp.min(credential_expires_at.timestamp());
     }
     if exp <= iat {
-        return Err(TokenExchangeError::NonPositiveLifetime);
+        return Err(TokenExchangeError::CredentialChainExpired);
     }
 
     let role_refs = authz.effective_roles().unwrap_or(&[]).to_vec();
@@ -548,17 +549,17 @@ mod tests {
         // subject_token expiry == iat
         assert!(matches!(
             build_claims_with_expiries(at(1000), at(2000), 1900),
-            Err(TokenExchangeError::NonPositiveLifetime)
+            Err(TokenExchangeError::CredentialChainExpired)
         ));
         // app-cred expiry == iat
         assert!(matches!(
             build_claims_with_expiries(at(2000), at(1000), 1900),
-            Err(TokenExchangeError::NonPositiveLifetime)
+            Err(TokenExchangeError::CredentialChainExpired)
         ));
         // configured lifetime ceiling == iat
         assert!(matches!(
             build_claims_with_expiries(at(2000), at(2000), 1000),
-            Err(TokenExchangeError::NonPositiveLifetime)
+            Err(TokenExchangeError::CredentialChainExpired)
         ));
 
         // One second of remaining lifetime is the smallest valid token.
@@ -596,7 +597,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(matches!(err, TokenExchangeError::NonPositiveLifetime));
+        assert!(matches!(err, TokenExchangeError::CredentialChainExpired));
     }
 
     #[test]

@@ -130,8 +130,8 @@ pub(super) async fn handle_token_exchange_grant(
                     "subject_token is missing an expiry claim, cannot be exchanged",
                 )
             }
-            TokenExchangeError::NonPositiveLifetime => {
-                tracing::warn!(error = %e, "subject_token or application credential expiry does not permit token exchange");
+            TokenExchangeError::CredentialChainExpired => {
+                tracing::warn!(error = %e, "subject_token or application credential chain is already expireed or expires too soon");
                 Oauth2TokenError::invalid_grant(
                     "subject_token or application credential expiry does not permit token exchange",
                 )
