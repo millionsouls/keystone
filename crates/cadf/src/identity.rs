@@ -9,6 +9,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+// Crypto inventory: AUD-2; see doc/src/contributor/crypto-inventory.md
 //
 //! Identity of the service embedding the audit framework.
 //!
@@ -43,6 +44,12 @@ impl ServiceIdentity {
     /// `{name}-audit-hmac-v1:{node_id}`.
     pub(crate) fn kdf_info(&self, node_id: &str) -> String {
         format!("{}-audit-hmac-v1:{node_id}", self.name)
+    }
+
+    /// HKDF `salt` of the per-node signing key:
+    /// `{name}-audit-hmac-salt-v1`. Fixed per service and never secret.
+    pub(crate) fn kdf_salt(&self) -> String {
+        format!("{}-audit-hmac-salt-v1", self.name)
     }
 
     /// Prometheus metric name: `{name}_audit_{suffix}`.
