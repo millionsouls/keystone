@@ -181,13 +181,14 @@ async fn test_token_exchange_full_flow_issues_app_cred_delegated_claims() -> Res
     let (subject_token, _user_guard, _project_guard) =
         mint_app_cred_subject_token(&state, &domain.id, app_cred_expires_at).await?;
 
-    let (vsc, delegation) = validate_subject_token(&state, &subject_token).await?;
+    let (vsc, delegation, credential_expiration) =
+        validate_subject_token(&state, &subject_token).await?;
     let issuer = format!("https://ks.example/v4/oauth2/{}", domain.id);
-    let now = chrono::Utc::now().timestamp();
     let claims = build_token_exchange_claims(
         &client,
         &vsc,
         delegation,
+        credential_expiration,
         &issuer,
         Uuid::new_v4().to_string(),
         chrono::Utc::now().timestamp(),
@@ -211,17 +212,20 @@ async fn test_token_exchange_caps_expiry_at_short_lived_app_credential() -> Resu
     let (subject_token, _user_guard, _project_guard) =
         mint_app_cred_subject_token(&state, &domain.id, app_cred_expires_at).await?;
 
-    let (vsc, delegation) = validate_subject_token(&state, &subject_token).await?;
+    let (vsc, delegation, credential_expiration) =
+        validate_subject_token(&state, &subject_token).await?;
     let issuer = format!("https://ks.example/v4/oauth2/{}", domain.id);
     let now = chrono::Utc::now().timestamp();
     let claims = build_token_exchange_claims(
         &client,
         &vsc,
         delegation,
+        credential_expiration,
         &issuer,
         Uuid::new_v4().to_string(),
-        now,
-        now + 900,
+        chrono::Utc::now().timestamp(),
+        chrono::Utc::now().timestamp() + 900,
+        Audience::control_plane(),
     )?;
 
     assert_eq!(claims.exp, app_cred_expires_at.timestamp());
@@ -245,12 +249,15 @@ async fn test_token_exchange_rejects_cross_domain_subject_token() -> Result<()> 
     let (subject_token_a, _user_guard, _project_guard) =
         mint_app_cred_subject_token(&state, &domain_a.id, app_cred_expires_at).await?;
 
-    let (vsc, delegation) = validate_subject_token(&state, &subject_token_a).await?;
+    let (vsc, delegation, credential_expiration) =
+        validate_subject_token(&state, &subject_token_a).await?;
+    // ...rest unchanged
     let issuer_b = format!("https://ks.example/v4/oauth2/{}", domain_b.id);
     let err = build_token_exchange_claims(
         &client_b,
         &vsc,
         delegation,
+        credential_expiration,
         &issuer_b,
         Uuid::new_v4().to_string(),
         chrono::Utc::now().timestamp(),
