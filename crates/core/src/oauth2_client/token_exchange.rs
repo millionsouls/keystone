@@ -491,6 +491,7 @@ mod tests {
             "jti-1".to_string(),
             1000,
             requested_exp,
+            Audience::control_plane(),
         )
     }
 

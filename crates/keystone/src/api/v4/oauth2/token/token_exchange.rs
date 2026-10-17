@@ -496,9 +496,10 @@ mod tests {
             .expect_get_by_client_id()
             .returning(move |_, _| Ok(Some(client.clone())));
         let mut token_mock = crate::token::MockTokenProvider::default();
+        let expires_at = chrono::Utc::now() + chrono::Duration::hours(1);
         token_mock
             .expect_validate_to_context()
-            .returning(|_, _, _, _| Ok(app_cred_delegated_vsc()));
+            .returning(move |_, _, _, _| Ok(app_cred_delegated_vsc(expires_at, expires_at)));
         let mut catalog_mock = crate::catalog::MockCatalogProvider::default();
         catalog_mock.expect_list_services().returning(|_, _| {
             Ok(["compute", "network"]
