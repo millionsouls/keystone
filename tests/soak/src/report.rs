@@ -40,12 +40,15 @@ pub struct LoadSummary {
     pub transport_errors: u64,
     pub status_codes: BTreeMap<u16, u64>,
     pub latency_ms: Latency,
+    /// Latency of `read`, `auth` and `write` requests.
+    pub latency_by_class_ms: BTreeMap<String, Latency>,
     pub failing_endpoints: Vec<Endpoint>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Latency {
+    pub requests: u64,
     pub p50: u64,
     pub p95: u64,
     pub p99: u64,
@@ -185,7 +188,9 @@ pub fn render_markdown(v: &Verdict) -> String {
         o,
         "- nodes: {} ({} scraped, {} ready), leaders: {}, voters: {}, learners: {}\n\
          - applied index spread: {}, max apply lag: {}, max replication lag: {}\n\
-         - quarantined partitions: {}, disk spread ratio: {:.2}",
+         - quarantined partitions: {}, disk spread ratio: {:.2}\n\
+         - applied entries: {}, disk per entry and node: {:.0} B\n\
+         - disk growth: {} node(s) judged without a restart, largest {:+.1}%",
         sm.nodes,
         sm.nodes_scraped,
         sm.nodes_ready,
@@ -196,7 +201,11 @@ pub fn render_markdown(v: &Verdict) -> String {
         sm.max_apply_lag,
         sm.max_replication_lag,
         sm.quarantined_total,
-        sm.disk_spread_ratio
+        sm.disk_spread_ratio,
+        sm.applied_index_max,
+        sm.bytes_per_entry,
+        sm.disk_growth_nodes,
+        sm.disk_growth_max * 100.0
     );
 
     if !v.violations.is_empty() {
@@ -262,16 +271,21 @@ pub fn render_markdown(v: &Verdict) -> String {
     if !loaded.is_empty() {
         let _ = writeln!(
             o,
-            "\n| # | kind | users | start | requests | failed | 429 | p50 ms | p95 ms | max ms |\n\
-             |---|---|---|---|---|---|---|---|---|---|"
+            "\n| # | kind | users | start | requests | failed | 429 | p50 ms | p95 ms | p99 ms | max ms | p99 read | p99 write | p99 auth |\n\
+             |---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
         );
         // The most recent phases, the interesting ones for a running soak.
         let tail = &loaded[loaded.len().saturating_sub(TABLE_ROWS)..];
         for p in tail {
             if let Some(s) = &p.summary {
+                let class_p99 = |c: &str| {
+                    s.latency_by_class_ms
+                        .get(c)
+                        .map_or("-".to_string(), |l| l.p99.to_string())
+                };
                 let _ = writeln!(
                     o,
-                    "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+                    "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
                     p.seq,
                     p.kind,
                     p.users,
@@ -281,9 +295,217 @@ pub fn render_markdown(v: &Verdict) -> String {
                     s.throttled,
                     s.latency_ms.p50,
                     s.latency_ms.p95,
-                    s.latency_ms.max
+                    s.latency_ms.p99,
+                    s.latency_ms.max,
+                    class_p99("read"),
+                    class_p99("write"),
+                    class_p99("auth"),
                 );
             }
+        }
+    }
+
+    let k = &v.canary;
+    if k.totals.writes > 0 {
+        let _ = writeln!(o, "\n## Canary\n");
+        let _ = writeln!(
+            o,
+            "{} records written, {} node reads: {} stale, {} altered, {} errors (not judged)",
+            k.totals.writes,
+            k.totals.reads,
+            k.totals.stale_reads,
+            k.totals.mismatches,
+            k.totals.read_errors
+        );
+        for f in k.failures.iter().rev().take(TABLE_ROWS).rev() {
+            let _ = writeln!(o, "- {} `{}`: {}", hms(f.at_secs), f.check, f.detail);
+        }
+    }
+
+    let c = &v.chaos;
+    if c.totals.kills > 0 {
+        let _ = writeln!(o, "\n## Chaos\n");
+        let _ = writeln!(
+            o,
+            "{} pods deleted under load: {} recovered, {} did not; recovery last {} s, max {} s",
+            c.totals.kills,
+            c.totals.recovered,
+            c.totals.timed_out,
+            c.totals.last_recovery_secs,
+            c.totals.max_recovery_secs
+        );
+        let _ = writeln!(o, "\n| # | pod | at | recovery |\n|---|---|---|---|");
+        for e in c.events.iter().rev().take(TABLE_ROWS).rev() {
+            let outcome = match (e.recovery_secs, e.timed_out) {
+                (Some(s), _) => format!("{s} s"),
+                (None, true) => "TIMED OUT".to_string(),
+                (None, false) => "recovering".to_string(),
+            };
+            let _ = writeln!(
+                o,
+                "| {} | {} | {} | {outcome} |",
+                e.seq,
+                e.pod,
+                hms(e.at_secs)
+            );
+        }
+    }
+
+    let m = &v.membership;
+    if m.totals.runs > 0 {
+        let _ = writeln!(o, "\n## Membership churn\n");
+        let _ = writeln!(
+            o,
+            "{} scenarios ({} wipes, {} scales): {} failed a check; longest {} s",
+            m.totals.runs, m.totals.wipes, m.totals.scales, m.totals.failed, m.totals.max_took_secs
+        );
+        let _ = writeln!(
+            o,
+            "\n| # | scenario | node | at | took | write gap | failures |\n|---|---|---|---|---|---|---|"
+        );
+        for e in m.events.iter().rev().take(TABLE_ROWS).rev() {
+            let took = match (e.took_secs, e.done) {
+                (Some(s), _) => format!("{s} s"),
+                (None, _) => "running".to_string(),
+            };
+            let failures = e
+                .failures
+                .iter()
+                .map(|f| f.check)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = writeln!(
+                o,
+                "| {} | {} | {} | {} | {took} | {} s | {failures} |",
+                e.seq,
+                e.kind,
+                if e.node.is_empty() { "-" } else { &e.node },
+                hms(e.at_secs),
+                e.max_write_gap_secs
+            );
+        }
+    }
+
+    let sp = &v.spire;
+    if sp.totals.restarts > 0 {
+        let _ = writeln!(o, "\n## SPIRE agent restarts\n");
+        let _ = writeln!(
+            o,
+            "{} agent restarts: {} failed a check; agent ready within {} s at most; {} keystone restarts",
+            sp.totals.restarts,
+            sp.totals.failed,
+            sp.totals.max_agent_ready_secs,
+            sp.totals.keystone_restarts
+        );
+        let _ = writeln!(
+            o,
+            "\n| # | agent | at | agent ready | keystone restarts | write gap | failures |\n|---|---|---|---|---|---|---|"
+        );
+        for e in sp.events.iter().rev().take(TABLE_ROWS).rev() {
+            let ready = match (e.agent_ready_secs, e.done) {
+                (Some(s), _) => format!("{s} s"),
+                (None, true) => "NO".to_string(),
+                (None, false) => "pending".to_string(),
+            };
+            let failures = e
+                .failures
+                .iter()
+                .map(|f| f.check)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = writeln!(
+                o,
+                "| {} | {} | {} | {ready} | {} | {} s | {failures} |",
+                e.seq,
+                e.pod,
+                hms(e.at_secs),
+                e.keystone_restarts,
+                e.max_write_gap_secs
+            );
+        }
+    }
+
+    let r = &v.rollout;
+    if r.totals.rollouts > 0 {
+        let _ = writeln!(o, "\n## Rolling restarts\n");
+        let _ = writeln!(
+            o,
+            "{} rolling restarts: {} failed a check; converged in {} s last, {} s max; \
+             longest stretch without a write {} s",
+            r.totals.rollouts,
+            r.totals.failed,
+            r.totals.last_converged_secs,
+            r.totals.max_converged_secs,
+            r.totals.max_write_gap_secs
+        );
+        let _ = writeln!(
+            o,
+            "\n| # | at | rolled out | converged | write gap | writes failed | failures |\n|---|---|---|---|---|---|---|"
+        );
+        let secs = |v: Option<u64>, done: bool| match (v, done) {
+            (Some(s), _) => format!("{s} s"),
+            (None, true) => "NO".to_string(),
+            (None, false) => "pending".to_string(),
+        };
+        for e in r.events.iter().rev().take(TABLE_ROWS).rev() {
+            let failures = e
+                .failures
+                .iter()
+                .map(|f| f.check)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = writeln!(
+                o,
+                "| {} | {} | {} | {} | {} s | {}/{} | {failures} |",
+                e.seq,
+                hms(e.at_secs),
+                secs(e.rolled_secs, e.done),
+                secs(e.converged_secs, e.done),
+                e.max_write_gap_secs,
+                e.failed_probes,
+                e.probes
+            );
+        }
+    }
+
+    let n = &v.partition;
+    if n.totals.partitions > 0 {
+        let _ = writeln!(o, "\n## Partitions\n");
+        let _ = writeln!(
+            o,
+            "{} nodes isolated: {} failed a check, {} were not noticed by the nodes; \
+             convergence last {} s, max {} s",
+            n.totals.partitions,
+            n.totals.failed,
+            n.totals.ineffective,
+            n.totals.last_heal_secs,
+            n.totals.max_heal_secs
+        );
+        let _ = writeln!(
+            o,
+            "\n| # | node | role | at | cut took effect | converged | failures |\n|---|---|---|---|---|---|---|"
+        );
+        for e in n.events.iter().rev().take(TABLE_ROWS).rev() {
+            let healed = match (e.heal_secs, e.done) {
+                (Some(s), _) => format!("{s} s"),
+                (None, true) => "NO".to_string(),
+                (None, false) => "pending".to_string(),
+            };
+            let failures = e
+                .failures
+                .iter()
+                .map(|f| f.check)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = writeln!(
+                o,
+                "| {} | {} | {} | {} | {} | {healed} | {failures} |",
+                e.seq,
+                e.pod,
+                e.role,
+                hms(e.at_secs),
+                if e.effective { "yes" } else { "no" }
+            );
         }
     }
 

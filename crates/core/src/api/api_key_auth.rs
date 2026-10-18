@@ -290,15 +290,17 @@ async fn resolve_verified_api_client(
         .get_by_lookup_hash(state, &domain_id, &parsed.lookup_hash)
         .await
         .map_err(|e| {
+            // A storage failure says nothing about the credential: answering
+            // 401 would make the client discard a valid key.
             warn!(error = %e, "api_key lookup failed");
-            AuthenticationError::Unauthorized
+            KeystoneApiError::ServiceUnavailable("api_key lookup failed".to_string())
         })?;
 
     let Some(resource) = resource else {
         // Dummy hash: burn the same Argon2id cost as a real verification
         // to prevent timing-based enumeration of valid lookup hashes
         // (ADR 0021 Invariant 7).
-        debug!(
+        warn!(
             domain_id,
             lookup_hash = %parsed.lookup_hash,
             "api_key lookup returned no resource"
@@ -309,7 +311,7 @@ async fn resolve_verified_api_client(
 
     let now = chrono::Utc::now().timestamp();
     if !resource.is_active(now) {
-        debug!(
+        warn!(
             domain_id,
             lookup_hash = %parsed.lookup_hash,
             enabled = resource.enabled,
@@ -336,7 +338,7 @@ async fn resolve_verified_api_client(
         // cost, letting an attacker distinguish "this lookup_hash exists
         // but my IP is disallowed" from "this lookup_hash doesn't exist"
         // by response latency alone (ADR 0021 Invariant 7).
-        debug!(
+        warn!(
             domain_id,
             client_id = %resource.client_id,
             ?effective_ip,
@@ -355,7 +357,7 @@ async fn resolve_verified_api_client(
             AuthenticationError::Unauthorized
         })?;
     if !verified {
-        debug!(
+        warn!(
             domain_id,
             client_id = %resource.client_id,
             lookup_hash = %parsed.lookup_hash,

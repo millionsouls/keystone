@@ -21,6 +21,7 @@
 //! [`CertExpiryWatchdog`] that forces certificate renewal before expiry.
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -97,6 +98,10 @@ impl RaftTlsClient {
             Self::Spiffe(cfg) => {
                 let connector = SpiffeConnector { tls: cfg.clone() };
                 Channel::builder(format!("http://{}", strip_scheme(addr)).parse()?)
+                    .connect_timeout(CONNECT_TIMEOUT)
+                    .http2_keep_alive_interval(KEEPALIVE_INTERVAL)
+                    .keep_alive_timeout(KEEPALIVE_TIMEOUT)
+                    .keep_alive_while_idle(true)
                     .connect_with_connector(connector)
                     .await
                     .map_err(|e| StoreError::Other(eyre::eyre!("SPIFFE gRPC connect failed: {e}")))
@@ -136,7 +141,14 @@ impl tower::Service<http::Uri> for SpiffeConnector {
                 })?
                 .to_owned();
             let port = uri.port_u16().unwrap_or(443);
-            let tcp = tokio::net::TcpStream::connect(format!("{host}:{port}")).await?;
+            let tcp = tokio::time::timeout(
+                CONNECT_TIMEOUT,
+                tokio::net::TcpStream::connect(format!("{host}:{port}")),
+            )
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timed out")
+            })??;
             let connector = tokio_rustls::TlsConnector::from(tls);
             // `SpiffeServerCertVerifier` validates the peer's SPIFFE URI SAN
             // and ignores the DNS server name, so any valid
@@ -187,6 +199,33 @@ impl NetworkManager {
 /// this often bounds how long a stale session can survive in both TLS modes.
 const CHANNEL_MAX_AGE: Duration = Duration::from_secs(300);
 
+/// Number of channels (HTTP/2 connections) kept per peer.
+///
+/// h2 counts every locally reset stream on a connection and never decrements
+/// the count. At 1024 it sends `GOAWAY(too_many_internal_resets)`, failing all
+/// requests on that connection. Reads that time out or are dropped under load
+/// reset streams, so one connection per peer reaches the cap well within
+/// [`CHANNEL_MAX_AGE`]. Spreading requests over several connections multiplies
+/// the headroom by this factor.
+const CHANNELS_PER_PEER: usize = 4;
+
+/// Time allowed to establish a TCP (and, in SPIFFE mode, TLS) connection.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// HTTP/2 PING interval on Raft channels, also while no request is in flight.
+///
+/// OpenRaft replicates over one long-lived `StreamAppend` stream per peer. If
+/// the peer disappears without closing the connection (pod replaced under a
+/// new IP, node power loss), nothing on the stream fails until the kernel
+/// gives up retransmitting, which takes many minutes: the leader silently
+/// stops replicating to that peer and never reconnects. Keepalive pings turn
+/// that into a failed stream within [`KEEPALIVE_INTERVAL`] +
+/// [`KEEPALIVE_TIMEOUT`], so OpenRaft re-establishes it.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Time to wait for a PING acknowledgement before the connection is dropped.
+const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Per-peer cache of established gRPC channels.
 ///
 /// OpenRaft asks the factory for a new client for every replication stream and
@@ -196,13 +235,17 @@ const CHANNEL_MAX_AGE: Duration = Duration::from_secs(300);
 /// delays `AppendEntries` replies past OpenRaft's 500ms heartbeat timeout and
 /// makes the readers retry, creating yet more handshakes. A tonic `Channel`
 /// is a cheaply cloneable handle that multiplexes requests over one HTTP/2
-/// connection and reconnects on its own, so one per peer address is enough.
+/// connection and reconnects on its own, so a few per peer address are enough
+/// (see [`CHANNELS_PER_PEER`]).
 ///
 /// Entries are dropped when the static TLS configuration changes (or its
 /// source goes away) and after [`CHANNEL_MAX_AGE`].
 pub(crate) struct ChannelCache {
     tls_client: Mutex<RaftTlsClient>,
+    /// Keyed by peer address and pool slot.
     channels: Mutex<HashMap<String, (Channel, Instant)>>,
+    /// Round-robin position, selects the pool slot of the next request.
+    next_slot: AtomicUsize,
     max_age: Duration,
 }
 
@@ -215,6 +258,7 @@ impl ChannelCache {
         Self {
             tls_client: Mutex::new(tls_client),
             channels: Mutex::new(HashMap::new()),
+            next_slot: AtomicUsize::new(0),
             max_age,
         }
     }
@@ -243,9 +287,18 @@ impl ChannelCache {
         tls.clone()
     }
 
-    /// Return the channel to `addr`, connecting if there is none yet.
+    /// Cache key of the next pool slot for `addr`.
+    fn pool_key(&self, addr: &str) -> String {
+        let slot = self.next_slot.fetch_add(1, Ordering::Relaxed) % CHANNELS_PER_PEER;
+        format!("{addr}#{slot}")
+    }
+
+    /// Return a channel to `addr`, connecting if there is none yet.
+    ///
+    /// Requests are spread round-robin over [`CHANNELS_PER_PEER`] channels.
     pub(crate) async fn channel(&self, addr: &str) -> Result<Channel, RPCError> {
-        let key = strip_scheme(addr).to_string();
+        let addr = strip_scheme(addr);
+        let key = self.pool_key(addr);
 
         // No lock is held across an await.
         let tls_client = self.refresh();
@@ -259,7 +312,7 @@ impl ChannelCache {
             return Ok(channel.clone());
         }
 
-        let channel = Self::connect(&tls_client, &key).await?;
+        let channel = Self::connect(&tls_client, addr).await?;
         // Concurrent first users may each have connected; keep the first.
         Ok(self
             .channels
@@ -285,6 +338,11 @@ impl ChannelCache {
                 )
                 .tls_config(tls_cfg)
                 .map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))?
+                .connect_timeout(CONNECT_TIMEOUT)
+                .tcp_keepalive(Some(KEEPALIVE_INTERVAL))
+                .http2_keep_alive_interval(KEEPALIVE_INTERVAL)
+                .keep_alive_timeout(KEEPALIVE_TIMEOUT)
+                .keep_alive_while_idle(true)
                 .connect()
                 .await
                 .map_err(|e| RPCError::Unreachable(Unreachable::<TypeConfig>::new(&e)))
@@ -1027,6 +1085,15 @@ mod channel_cache_tests {
 
     fn cached(cache: &ChannelCache) -> usize {
         cache.channels.lock().unwrap().len()
+    }
+
+    #[tokio::test]
+    async fn spreads_requests_over_a_pool_per_peer() {
+        let (cache, _tx) = cache_with(CHANNEL_MAX_AGE);
+        let keys: std::collections::HashSet<_> = (0..CHANNELS_PER_PEER * 3)
+            .map(|_| cache.pool_key("peer:1"))
+            .collect();
+        assert_eq!(keys.len(), CHANNELS_PER_PEER);
     }
 
     #[tokio::test]
