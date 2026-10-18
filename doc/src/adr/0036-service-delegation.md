@@ -1143,12 +1143,15 @@ Where the phase 1 implementation refines or departs from the decision above:
 - **Client authentication.** Only `tls_client_auth` with an X.509-SVID on the
   internal interface is implemented; JWT-SVID `private_key_jwt` is phase 3.
 - **Errors and limits.** A disabled grant or lost role answers `403` with
-  error code `invalid_grant`. Redemption shares the token endpoint limiter,
-  keyed on the SVID, rather than a dedicated bucket. A grant quota answers
-  `429` without `Retry-After`.
+  error code `invalid_grant`. Redemption uses the token endpoint limiter's
+  quota with its own per-SVID key (`service_grant:<svid>`) rather than a
+  separately configured limiter. A grant quota answers `429` without
+  `Retry-After`, since waiting does not free quota.
 - **Registry.** Removing a client's policy is `remove_delegation: true` on
   update (a JSON `null` cannot be told apart from an absent field).
-  `max_role_ids` entries are not checked against existing roles.
+  `max_role_ids` entries added by a write must be existing roles; ids
+  already in the stored ceiling are not re-checked, so a role deleted later
+  does not block unrelated edits.
 - **List filter.** `domain_id` on `GET /v4/service-grants` filters on the
   grant's domain, which is the target project's domain. Domain managers
   are authorized on that same domain.
