@@ -21,7 +21,7 @@ set -euo pipefail
 # The script lives in <repo>/experiments, so run from the repo root.
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-EXPECTED_TOKEN_EXCHANGE_TESTS=15
+EXPECTED_TOKEN_EXCHANGE_TESTS=17
 
 for tool in cargo; do
   command -v "$tool" >/dev/null 2>&1 || {
