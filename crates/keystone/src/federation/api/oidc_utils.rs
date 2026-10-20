@@ -335,7 +335,7 @@ fn check_nonce(
 
 /// Build a `reqwest::Client` with redirect following disabled (SSRF guard)
 /// and a reasonable default timeout to prevent resource exhaustion.
-pub(super) fn build_http_client() -> Result<reqwest::Client, OidcError> {
+pub(crate) fn build_http_client() -> Result<reqwest::Client, OidcError> {
     openstack_keystone_tls_provider::install_default();
     reqwest::ClientBuilder::new()
         .redirect(reqwest::redirect::Policy::none())
@@ -345,12 +345,8 @@ pub(super) fn build_http_client() -> Result<reqwest::Client, OidcError> {
 }
 
 /// An issuer trusted to sign external JWTs.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by the external token exchange path")
-)]
 #[derive(Clone, Copy, Debug)]
-pub(super) struct TrustedIssuer<'a> {
+pub(crate) struct TrustedIssuer<'a> {
     /// Issuer identifier, compared exactly with the `iss` claim of the token.
     pub issuer: &'a str,
     /// Static JWKS URL. When set, discovery is skipped.
@@ -359,11 +355,7 @@ pub(super) struct TrustedIssuer<'a> {
 
 /// Read `iss` from a JWT payload without verifying the token. Only use the
 /// result to pick a trusted issuer; `verify_jwt` checks the signed claim later.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by the external token exchange path")
-)]
-pub(super) fn extract_issuer(token: &str) -> Result<String, OidcError> {
+pub(crate) fn extract_issuer(token: &str) -> Result<String, OidcError> {
     // Reject anything without a valid JWT header before parsing the payload by
     // hand. The decoded header itself is not needed here.
     decode_header(token)?;
@@ -400,11 +392,7 @@ pub(super) fn extract_issuer(token: &str) -> Result<String, OidcError> {
 ///
 /// `audiences` must not be empty: `verify_jwt` skips the `aud` check for an
 /// empty list, which would let a token minted for another service through.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by the external token exchange path")
-)]
-pub(super) async fn verify_external_jwt(
+pub(crate) async fn verify_external_jwt(
     token: &str,
     trusted_issuers: &[TrustedIssuer<'_>],
     audiences: &[&str],
@@ -433,6 +421,23 @@ pub(super) async fn verify_external_jwt(
     };
 
     verify_jwt(token, &jwks, Some(trusted.issuer), None, audiences)
+}
+
+/// Build the trusted issuer list from identity providers. An enabled provider
+/// with a `bound_issuer` is trusted, and its `jwks_url` is used when it has one.
+pub(crate) fn trusted_issuers_from_idps(
+    idps: &[openstack_keystone_core_types::federation::IdentityProvider],
+) -> Vec<TrustedIssuer<'_>> {
+    idps.iter()
+        .filter(|idp| idp.enabled)
+        .filter_map(|idp| {
+            let issuer = idp.bound_issuer.as_deref().filter(|i| !i.is_empty())?;
+            Some(TrustedIssuer {
+                issuer,
+                jwks_url: idp.jwks_url.as_deref().filter(|u| !u.is_empty()),
+            })
+        })
+        .collect()
 }
 
 /// Signing key and helpers shared by the federation and OAuth2 OP tests.
@@ -1988,5 +1993,159 @@ mod tests {
             matches!(result, Err(OidcError::HttpRequest { .. })),
             "JWKS fetch failure must fail closed, got {result:?}"
         );
+    }
+
+    fn idp(
+        id: &str,
+        enabled: bool,
+        bound_issuer: Option<&str>,
+        jwks_url: Option<&str>,
+    ) -> openstack_keystone_core_types::federation::IdentityProvider {
+        openstack_keystone_core_types::federation::IdentityProvider {
+            id: id.into(),
+            name: id.into(),
+            enabled,
+            bound_issuer: bound_issuer.map(Into::into),
+            jwks_url: jwks_url.map(Into::into),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn trusted_issuers_from_idps_uses_enabled_providers_with_bound_issuer() {
+        let idps = vec![
+            idp("a", true, Some("https://a.example.com"), None),
+            idp(
+                "b",
+                true,
+                Some("https://b.example.com"),
+                Some("https://b.example.com/keys"),
+            ),
+            idp("disabled", false, Some("https://c.example.com"), None),
+            idp("no-issuer", true, None, None),
+            idp("empty-issuer", true, Some(""), None),
+        ];
+        let trusted = trusted_issuers_from_idps(&idps);
+
+        assert_eq!(trusted.len(), 2);
+        assert_eq!(trusted[0].issuer, "https://a.example.com");
+        assert_eq!(trusted[0].jwks_url, None);
+        assert_eq!(trusted[1].issuer, "https://b.example.com");
+        assert_eq!(trusted[1].jwks_url, Some("https://b.example.com/keys"));
+    }
+
+    /// Demo for the class project. Runs `verify_external_jwt` against a mock
+    /// identity provider over real HTTP and prints the result of each case.
+    /// Run it with `--nocapture` to see the output.
+    #[tokio::test]
+    #[allow(clippy::print_stdout, reason = "the demo prints its results")]
+    async fn demo_external_jwt_verification() {
+        fn report(name: &str, result: &Result<serde_json::Value, OidcError>) {
+            match result {
+                Ok(claims) => println!("{name:<34} ACCEPTED  sub={}", claims["sub"]),
+                Err(e) => println!("{name:<34} REJECTED  {e}"),
+            }
+        }
+
+        let server = MockServer::start();
+        let base_url = server.base_url();
+        let (discovery, jwks) = mock_idp(&server, &base_url, &jwks_body());
+        let client = test_client();
+
+        // Identity provider records, the same struct the database returns.
+        let idps = vec![
+            idp("keycloak", true, Some(base_url.as_str()), None),
+            idp(
+                "disabled",
+                false,
+                Some("https://disabled.example.com"),
+                None,
+            ),
+            idp("no-bound-issuer", true, None, None),
+        ];
+        let trusted_list = trusted_issuers_from_idps(&idps);
+
+        println!("\nmock identity provider: {base_url}");
+        println!("identity providers:     keycloak (enabled), disabled, no-bound-issuer");
+        println!(
+            "trusted issuers:        {:?}\n",
+            trusted_list.iter().map(|t| t.issuer).collect::<Vec<_>>()
+        );
+        assert_eq!(trusted_list.len(), 1);
+
+        // 1. Good token from the trusted issuer.
+        let good_claims = valid_claims(&base_url, "my-client", None);
+        let good = make_jwt(&good_claims, Some(TEST_KID));
+        let result = verify_external_jwt(&good, &trusted_list, &["my-client"], &client).await;
+        report("valid token", &result);
+        assert_eq!(result.unwrap()["sub"], "user123");
+        discovery.assert_calls(1);
+        jwks.assert_calls(1);
+
+        // 2. Issuer that is not on the list. No request may be made for it.
+        let evil = make_jwt(
+            &valid_claims("https://evil.example.com", "my-client", None),
+            Some(TEST_KID),
+        );
+        let result = verify_external_jwt(&evil, &trusted_list, &["my-client"], &client).await;
+        report("issuer not on the list", &result);
+        assert!(matches!(result, Err(OidcError::UntrustedIssuer)));
+        discovery.assert_calls(1);
+        jwks.assert_calls(1);
+        println!("{:<34} (still 1 discovery and 1 key request)", "");
+
+        // 2b. Issuer of a provider that is disabled.
+        let disabled = make_jwt(
+            &valid_claims("https://disabled.example.com", "my-client", None),
+            Some(TEST_KID),
+        );
+        let result = verify_external_jwt(&disabled, &trusted_list, &["my-client"], &client).await;
+        report("issuer of a disabled provider", &result);
+        assert!(matches!(result, Err(OidcError::UntrustedIssuer)));
+
+        // 3. Token made for another service.
+        let other_aud = make_jwt(
+            &valid_claims(&base_url, "other-service", None),
+            Some(TEST_KID),
+        );
+        let result = verify_external_jwt(&other_aud, &trusted_list, &["my-client"], &client).await;
+        report("wrong audience", &result);
+        assert!(matches!(result, Err(OidcError::JwtDecode { .. })));
+
+        // 4. Caller passes no audience.
+        let result = verify_external_jwt(&good, &trusted_list, &[], &client).await;
+        report("empty audience list", &result);
+        assert!(matches!(result, Err(OidcError::AudienceRequired)));
+
+        // 5. Expired token.
+        let mut expired_claims = good_claims.clone();
+        expired_claims["exp"] = json!((Utc::now() - TimeDelta::hours(2)).timestamp());
+        let expired = make_jwt(&expired_claims, Some(TEST_KID));
+        let result = verify_external_jwt(&expired, &trusted_list, &["my-client"], &client).await;
+        report("expired token", &result);
+        assert!(matches!(result, Err(OidcError::JwtDecode { .. })));
+
+        // 6. HS256 token, the algorithm confusion attack.
+        let hs256 = encode(
+            &JwtHeader::new(jsonwebtoken::Algorithm::HS256),
+            &good_claims,
+            &EncodingKey::from_secret(b"symmetric-secret"),
+        )
+        .unwrap();
+        let result = verify_external_jwt(&hs256, &trusted_list, &["my-client"], &client).await;
+        report("HS256 token", &result);
+        assert!(matches!(result, Err(OidcError::UnsupportedAlgorithm(_))));
+
+        // 7. Payload changed after signing.
+        let parts: Vec<&str> = good.split('.').collect();
+        let mut forged_claims = good_claims.clone();
+        forged_claims["sub"] = json!("admin");
+        let forged_payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&forged_claims).unwrap());
+        let forged = format!("{}.{}.{}", parts[0], forged_payload, parts[2]);
+        let result = verify_external_jwt(&forged, &trusted_list, &["my-client"], &client).await;
+        report("payload changed after signing", &result);
+        assert!(matches!(result, Err(OidcError::JwtDecode { .. })));
+
+        println!("\nonly the first token was accepted\n");
     }
 }
