@@ -11,10 +11,12 @@
 // limitations under the License.
 //
 // SPDX-License-Identifier: Apache-2.0
+#![allow(clippy::module_inception)]
 mod application_credential;
 mod auth_plugin;
 mod authorization;
 mod password;
+mod provider;
 mod revoke;
 mod token;
 mod validate;

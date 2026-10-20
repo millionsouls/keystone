@@ -41,6 +41,7 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use chrono::Utc;
+use openstack_keystone_common::StorageUnavailable;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -97,8 +98,8 @@ impl From<u8> for DataTier {
 /// for [`DataTier::Public`] and [`DataTier::Internal`] records and only when
 /// the operator enabled local reads; everything else silently falls back to
 /// the linearizable path. Staleness is unbounded: a lagging or partitioned
-/// node serves whatever it last applied. Callers must therefore never use it for data that
-/// feeds an authorization decision (ADR 0016-v2 §3).
+/// node serves whatever it last applied. Callers must therefore never use it
+/// for data that feeds an authorization decision (ADR 0016-v2 §3).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ReadConsistency {
     /// Never stale: confirmed through Raft `ReadIndex` before reading.
@@ -152,7 +153,7 @@ pub enum StoreError {
     /// read, since that could return revoked credentials, deleted users, or
     /// other stale sensitive data (security invariant 4).
     #[error("storage temporarily unavailable: {0}")]
-    Unavailable(String),
+    Unavailable(#[source] StorageUnavailable),
 
     /// Invalid UTF-8 string.
     #[error("invalid utf-8")]

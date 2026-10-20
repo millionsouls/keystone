@@ -23,6 +23,7 @@ use {
     std::error::Error,
 };
 
+use openstack_keystone_common::is_storage_unavailable;
 use openstack_keystone_core_types::api_key::ApiKeyProviderError;
 use openstack_keystone_core_types::application_credential::ApplicationCredentialProviderError;
 use openstack_keystone_core_types::assignment::AssignmentProviderError;
@@ -44,6 +45,7 @@ use openstack_keystone_core_types::resource::ResourceProviderError;
 use openstack_keystone_core_types::revoke::RevokeProviderError;
 use openstack_keystone_core_types::role::RoleProviderError;
 use openstack_keystone_core_types::scim::{ScimRealmProviderError, ScimResourceProviderError};
+use openstack_keystone_core_types::service_grant::ServiceGrantProviderError;
 use openstack_keystone_core_types::spiffe_key::SpiffeKeyProviderError;
 use openstack_keystone_core_types::token::TokenProviderError;
 use openstack_keystone_core_types::vendordata::VendordataProviderError;
@@ -86,6 +88,7 @@ impl IntoResponse for KeystoneApiError {
             KeystoneApiError::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
             KeystoneApiError::UnprocessableEntity(_) => StatusCode::UNPROCESSABLE_ENTITY,
             KeystoneApiError::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            KeystoneApiError::QuotaExceeded(_) => StatusCode::TOO_MANY_REQUESTS,
             _ => StatusCode::BAD_REQUEST,
         };
 
@@ -482,6 +485,11 @@ impl From<ApiKeyProviderError> for KeystoneApiError {
             ApiKeyProviderError::RaftNotAvailable => Self::NotImplemented(
                 "API Key storage requires distributed storage (raft)".to_string(),
             ),
+            ApiKeyProviderError::RaftStoreError { source }
+                if is_storage_unavailable(source.as_ref()) =>
+            {
+                Self::ServiceUnavailable(format!("storage temporarily unavailable: {source}"))
+            }
             other => Self::InternalError(other.to_string()),
         }
     }
@@ -496,9 +504,46 @@ impl From<Oauth2ClientProviderError> for KeystoneApiError {
             },
             Oauth2ClientProviderError::Conflict(x) => Self::Conflict(x),
             Oauth2ClientProviderError::Validation(x) => Self::UnprocessableEntity(x),
+            // The detail is another provider's error text: log it, do not
+            // return it.
+            Oauth2ClientProviderError::Dependency(x) => {
+                tracing::error!(error = %x, "OAuth2 client provider dependency failure");
+                Self::InternalError("dependency failure".to_string())
+            }
             Oauth2ClientProviderError::RaftNotAvailable => Self::NotImplemented(
                 "OAuth2 client storage requires distributed storage (raft)".to_string(),
             ),
+            Oauth2ClientProviderError::RaftStoreError { source }
+                if is_storage_unavailable(source.as_ref()) =>
+            {
+                Self::ServiceUnavailable(format!("storage temporarily unavailable: {source}"))
+            }
+            other => Self::InternalError(other.to_string()),
+        }
+    }
+}
+
+impl From<ServiceGrantProviderError> for KeystoneApiError {
+    fn from(value: ServiceGrantProviderError) -> Self {
+        match value {
+            ServiceGrantProviderError::NotFound(x) => Self::NotFound {
+                resource: "service_grant".into(),
+                identifier: x,
+            },
+            ServiceGrantProviderError::Conflict(x) => Self::Conflict(x),
+            // ADR 0036 §4.1: a grant naming an unusable grantee, project or
+            // role set is rejected with 400.
+            ServiceGrantProviderError::Validation(x) => Self::BadRequest(x),
+            err @ ServiceGrantProviderError::Forbidden(_) => Self::forbidden(err),
+            ServiceGrantProviderError::QuotaExceeded(x) => Self::QuotaExceeded(x),
+            ServiceGrantProviderError::RaftNotAvailable => Self::NotImplemented(
+                "service grant storage requires distributed storage (raft)".to_string(),
+            ),
+            ServiceGrantProviderError::RaftStoreError { source }
+                if is_storage_unavailable(source.as_ref()) =>
+            {
+                Self::ServiceUnavailable(format!("storage temporarily unavailable: {source}"))
+            }
             other => Self::InternalError(other.to_string()),
         }
     }
@@ -514,6 +559,11 @@ impl From<Oauth2SessionProviderError> for KeystoneApiError {
             Oauth2SessionProviderError::RaftNotAvailable => Self::NotImplemented(
                 "OAuth2 session storage requires distributed storage (raft)".to_string(),
             ),
+            Oauth2SessionProviderError::RaftStoreError { source }
+                if is_storage_unavailable(source.as_ref()) =>
+            {
+                Self::ServiceUnavailable(format!("storage temporarily unavailable: {source}"))
+            }
             other => Self::InternalError(other.to_string()),
         }
     }
@@ -556,6 +606,11 @@ impl From<Oauth2KeyProviderError> for KeystoneApiError {
                 resource: "oauth2_signing_key".into(),
                 identifier: "no raft storage configured for OAuth2 signing keys".into(),
             },
+            Oauth2KeyProviderError::RaftStoreError { source }
+                if is_storage_unavailable(source.as_ref()) =>
+            {
+                Self::ServiceUnavailable(format!("storage temporarily unavailable: {source}"))
+            }
             other => Self::InternalError(other.to_string()),
         }
     }
@@ -599,6 +654,11 @@ impl From<AuthPluginIdentityProviderError> for KeystoneApiError {
             // Every other variant is an infra/storage failure with no client-actionable
             // distinction (ADR 0025 §6.B/§6.C); surface as a generic 500 without
             // leaking backend detail on the linking path.
+            AuthPluginIdentityProviderError::RaftStoreError { source }
+                if is_storage_unavailable(source.as_ref()) =>
+            {
+                Self::ServiceUnavailable(format!("storage temporarily unavailable: {source}"))
+            }
             other => Self::InternalError(other.to_string()),
         }
     }
@@ -663,6 +723,9 @@ impl From<MappingProviderError> for KeystoneApiError {
             MappingProviderError::RaftNotAvailable => Self::NotImplemented(
                 "mapping provider requires distributed storage (raft)".to_string(),
             ),
+            MappingProviderError::RaftStoreError { source } if is_storage_unavailable(source.as_ref()) => {
+                Self::ServiceUnavailable(format!("storage temporarily unavailable: {source}"))
+            }
             MappingProviderError::RaftStoreError { source } => {
                 Self::InternalError(format!("raft storage error: {source}"))
             }
@@ -692,6 +755,11 @@ impl From<ScimRealmProviderError> for KeystoneApiError {
             ScimRealmProviderError::RaftNotAvailable => Self::NotImplemented(
                 "SCIM realm provider requires distributed storage (raft)".to_string(),
             ),
+            ScimRealmProviderError::RaftStoreError { source }
+                if is_storage_unavailable(source.as_ref()) =>
+            {
+                Self::ServiceUnavailable(format!("storage temporarily unavailable: {source}"))
+            }
             ScimRealmProviderError::RaftStoreError { source } => {
                 Self::InternalError(format!("raft storage error: {source}"))
             }
@@ -721,6 +789,11 @@ impl From<ScimResourceProviderError> for KeystoneApiError {
             ScimResourceProviderError::RaftNotAvailable => Self::NotImplemented(
                 "SCIM resource provider requires distributed storage (raft)".to_string(),
             ),
+            ScimResourceProviderError::RaftStoreError { source }
+                if is_storage_unavailable(source.as_ref()) =>
+            {
+                Self::ServiceUnavailable(format!("storage temporarily unavailable: {source}"))
+            }
             ScimResourceProviderError::RaftStoreError { source } => {
                 Self::InternalError(format!("raft storage error: {source}"))
             }
@@ -748,9 +821,11 @@ impl From<TokenProviderError> for KeystoneApiError {
             | TokenProviderError::TrustorUserDisabled(_) => {
                 Self::unauthorized(value, None::<String>)
             }
+            // A token whose user is gone is as unusable as an expired one.
             TokenProviderError::Expired
             | TokenProviderError::InvalidToken { .. }
-            | TokenProviderError::TokenRevoked => Self::unauthorized(value, None::<String>),
+            | TokenProviderError::TokenRevoked
+            | TokenProviderError::UserNotFound(_) => Self::unauthorized(value, None::<String>),
             TokenProviderError::DomainDisabled(x) => Self::NotFound {
                 resource: "domain".into(),
                 identifier: x,
@@ -823,6 +898,20 @@ impl From<KeystoneError> for KeystoneApiError {
 mod tests {
     use super::*;
     use axum::http::StatusCode;
+    use openstack_keystone_common::StorageUnavailable;
+
+    #[test]
+    fn raft_storage_unavailable_returns_503() {
+        let unavailable: KeystoneApiError =
+            ApiKeyProviderError::raft(StorageUnavailable::new("no leader")).into();
+        assert!(matches!(
+            unavailable,
+            KeystoneApiError::ServiceUnavailable(_)
+        ));
+        let other: KeystoneApiError =
+            ApiKeyProviderError::raft(std::io::Error::other("disk")).into();
+        assert!(matches!(other, KeystoneApiError::InternalError(_)));
+    }
 
     #[test]
     fn token_credential_rejections_return_401() {
@@ -832,6 +921,7 @@ mod tests {
                 source: Box::new(std::io::Error::other("invalid token detail")),
             },
             TokenProviderError::TokenRevoked,
+            TokenProviderError::UserNotFound("uid".into()),
         ];
 
         for error in errors {
@@ -1186,6 +1276,30 @@ mod tests {
             .get(header::RETRY_AFTER)
             .expect("Retry-After header must be present");
         assert_eq!(retry_after.to_str().unwrap(), "42");
+    }
+
+    #[test]
+    fn service_grant_errors_map_to_adr_statuses() {
+        let status = |e: ServiceGrantProviderError| {
+            <KeystoneApiError as IntoResponse>::into_response(KeystoneApiError::from(e)).status()
+        };
+        assert_eq!(
+            status(ServiceGrantProviderError::NotFound("g".into())),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            status(ServiceGrantProviderError::Validation("bad".into())),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            status(ServiceGrantProviderError::Forbidden("delegated".into())),
+            StatusCode::FORBIDDEN
+        );
+        let quota = <KeystoneApiError as IntoResponse>::into_response(KeystoneApiError::from(
+            ServiceGrantProviderError::QuotaExceeded("full".into()),
+        ));
+        assert_eq!(quota.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(quota.headers().get(header::RETRY_AFTER).is_none());
     }
 
     #[test]

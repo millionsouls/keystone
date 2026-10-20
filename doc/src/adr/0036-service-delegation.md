@@ -710,9 +710,15 @@ not grow two answers to any of them:
   parameter of `verify_openstack_access_token`). #1018 still breaks on a fixed
   audience because an external token's `aud` is never `openstack-apis`; this ADR
   needs §7.1 narrowing (`openstack-apis:<service type>`) accepted when §6.3
-  re-exchanges such a token as `subject_token`. One refactor to a
-  per-subject-kind validation profile (expected issuers, accepted audiences,
-  required claims) serves both; doing it twice guarantees divergence.
+  re-exchanges such a token as `subject_token`. A per-subject-kind profile
+  captures expected issuers, accepted audiences, required claims, and
+  time-limits so both paths can use one verifier. The shared profile API and
+  Keystone-native compatibility profile are now implemented in
+  `crates/core/src/oauth2_client/verify.rs`; the external-assertion profile
+  enforces the configured audience, required claims, 300-second maximum age
+  and lifetime, and 60-second clock skew. Endpoint dispatch, external issuer
+  key discovery, replay-cache checks, and mapping-engine integration remain
+  separate work.
 - **Confused-deputy replay gets one rule.** #1018's concern (an external token
   minted for someone else replayed at Keystone) is the same one §5.1 answers for
   JWT-SVID client assertions: pin `aud` to the fixed Keystone token-endpoint

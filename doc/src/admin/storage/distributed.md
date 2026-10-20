@@ -51,25 +51,25 @@ cluster member to contact; it defaults to `node_cluster_addr` from the config
 file when omitted. `init` always targets that local address, and `join` takes
 the member to contact as its positional argument.
 
-| Subcommand                                                                 | Target      | Description                                                |
-| -------------------------------------------------------------------------- | ----------- | ---------------------------------------------------------- |
-| `init`                                                                     | local node  | Bootstrap a new single-node cluster                        |
-| `join <cluster-addr>`                                                      | leader      | Adopt the cluster DEK, then join as a learner              |
-| `promote [--cluster-addr] <node-id>`                                       | leader      | Promote a learner to voting member                         |
-| `demote [--cluster-addr] <node-id>`                                        | leader      | Demote a voter to non-voting learner                       |
-| `remove-peer [--cluster-addr] <node-id>`                                   | leader      | Remove a voter from the cluster membership                 |
-| `transfer-leader [--cluster-addr] [<node-id>]`                             | leader      | Hand leadership over to another voter                      |
-| `list-peers [--cluster-addr]`                                              | any node    | Show cluster peers in a table                              |
-| `metrics [--cluster-addr]`                                                 | any node    | Show raw cluster metrics and leader status                 |
-| `status [--cluster-addr]`                                                  | any node    | Show DEK, rotation, quarantine and nonce state of the node |
-| `clear-quarantine [--cluster-addr] [--partition <name>]`                   | leader      | Clear a GCM-failure quarantine (default partition `data`)  |
-| `rotate-dek [--cluster-addr] [--emergency]`                                | leader      | Rotate the Data Encryption Key                             |
-| `rotate-dek [--cluster-addr] --local-quorum-bypass --justification <text>` | given node  | Stage a node-local emergency DEK candidate (no quorum)     |
-| `confirm-rotate-dek [--cluster-addr] --rotation-id <id>`                   | leader      | Confirm a pending emergency DEK rotation                   |
-| `list-dek-local-emergency-candidates [--cluster-addr]`                     | given node  | List node-local emergency DEK candidates                   |
-| `reconcile-dek-local-emergency [--cluster-addr] --rotation-id <id>`        | leader only | Install a node-local emergency DEK candidate through Raft  |
-| `backup [--cluster-addr] --output <file>`                                  | leader      | Create an encrypted Fjall snapshot                         |
-| `restore [--cluster-addr] --snapshot <file> [--elect]`                     | leader \*   | Restore an encrypted snapshot to the cluster               |
+| Subcommand                                                                          | Target      | Description                                                 |
+| ----------------------------------------------------------------------------------- | ----------- | ----------------------------------------------------------- |
+| `init`                                                                              | local node  | Bootstrap a new single-node cluster                         |
+| `join <cluster-addr>`                                                               | leader      | Adopt the cluster DEK, then join as a learner               |
+| `promote [--cluster-addr] <node-id>`                                                | leader      | Promote a learner to voting member                          |
+| `demote [--cluster-addr] <node-id>`                                                 | leader      | Demote a voter to non-voting learner                        |
+| `remove-peer [--cluster-addr] <node-id>`                                            | leader      | Remove a voter or a learner from the cluster membership     |
+| `transfer-leader [--cluster-addr] [<node-id>]`                                      | leader      | Hand leadership over to another voter                       |
+| `list-peers [--cluster-addr]`                                                       | any node    | Show cluster peers in a table                               |
+| `metrics [--cluster-addr]`                                                          | any node    | Show raw cluster metrics and leader status                  |
+| `status [--cluster-addr]`                                                           | any node    | Show DEK, rotation, quarantine and nonce state of the node  |
+| `clear-quarantine [--cluster-addr] [--partition <name>]`                            | leader      | Clear a GCM-failure quarantine (default partition `data`)   |
+| `rotate-dek [--cluster-addr] [--emergency]`                                         | leader      | Rotate the Data Encryption Key                              |
+| `rotate-dek [--cluster-addr] --local-quorum-bypass --justification <text>`          | given node  | Stage a node-local emergency DEK candidate (no quorum)      |
+| `confirm-rotate-dek [--cluster-addr] --rotation-id <id>`                            | leader      | Confirm a pending emergency DEK rotation                    |
+| `list-dek-local-emergency-candidates [--cluster-addr]`                              | given node  | List node-local emergency DEK candidates                    |
+| `reconcile-dek-local-emergency [--cluster-addr] --rotation-id <id>`                 | leader only | Install a node-local emergency DEK candidate through Raft   |
+| `backup [--cluster-addr] --output <file>`                                           | leader      | Create an encrypted Fjall snapshot                          |
+| `restore [--cluster-addr] --snapshot <file> [--elect]`                              | leader \*   | Restore an encrypted snapshot to the cluster                |
 
 **Leader targeting.** Membership changes, DEK rotations, quarantine clearing,
 backup and restore into a running cluster must be proposed by the Raft leader. A
@@ -771,6 +771,16 @@ node_listener_addr = "0.0.0.0:8310"
 # (`disabled` (default) or `local_for_public`).
 # local_reads_mode = "disabled"
 
+# Raft timing and log compaction. Raise the heartbeat and election timeouts for
+# clusters spread across availability zones. `raft_snapshot_logs_since_last = 0`
+# disables automatic snapshots. Defaults shown.
+# raft_heartbeat_interval_ms = 500
+# raft_election_timeout_min_ms = 1500
+# raft_election_timeout_max_ms = 3000
+# raft_snapshot_logs_since_last = 5000
+# raft_max_in_snapshot_log_to_keep = 1000
+# raft_purge_batch_size = 1
+
 # Audit spool directory (default: <path>/audit-spool) and its size bound
 # (default: 256 MiB).
 # audit_spool_dir = "/var/lib/keystone/storage/audit-spool"
@@ -830,7 +840,7 @@ trust_domains = "example.org"
 
 > **Warning:** `KEYSTONE_DEV_KEK` and `KEYSTONE_ALLOW_ENV_KEK` must never appear
 > in production Dockerfiles, Kubernetes manifests, or systemd units.
-> `tools/check_no_dev_mode.sh` checks for this (it is not run in CI yet).
+> `tools/check_no_dev_mode.sh` checks for this and runs in the `Linters` CI workflow.
 
 ### PKCS#11 and TPM KEK Providers
 
@@ -1412,8 +1422,10 @@ by the security team.
     the security team before any new encrypted context is added.
 
 11. **Deployment validation.** `tools/check_no_dev_mode.sh` rejects production
-    service definitions containing `--dev-mode` or `KEYSTONE_ALLOW_ENV_KEK`. It
-    is not wired into CI yet; run it as part of the deployment pipeline.
+    service definitions containing `--dev-mode` or `KEYSTONE_ALLOW_ENV_KEK`.
+    It runs in the `Linters` CI workflow; development artefacts (the skaffold
+    overlay, `tools/k8s/tests/`) are allow-listed in the script. Run it as part
+    of the deployment pipeline as well.
 
 12. **Startup pre-flight.** Before loading any key material, the node verifies
     `RLIMIT_CORE == 0` and `PR_SET_DUMPABLE == 0`. Failures emit CRITICAL log

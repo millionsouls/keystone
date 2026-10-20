@@ -5061,6 +5061,7 @@ dependencies = [
  "openstack-keystone-revoke-driver-sql",
  "openstack-keystone-role-driver-sql",
  "openstack-keystone-scim-driver-raft",
+ "openstack-keystone-service-grant-driver-raft",
  "openstack-keystone-storage-api",
  "openstack-keystone-telemetry",
  "openstack-keystone-tls-provider",
@@ -5115,6 +5116,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "dashmap",
  "inventory",
  "openstack-keystone-core",
  "openstack-keystone-core-types",
@@ -5134,6 +5136,7 @@ dependencies = [
  "derive_builder",
  "eyre",
  "http",
+ "openstack-keystone-common",
  "openstack-keystone-core-types",
  "secrecy",
  "serde",
@@ -5306,6 +5309,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "openstack-keystone-common"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "openstack-keystone-config"
 version = "0.1.0"
 dependencies = [
@@ -5457,6 +5467,7 @@ dependencies = [
  "mockall",
  "nix 0.31.3",
  "openraft",
+ "openstack-keystone-common",
  "openstack-keystone-config",
  "openstack-keystone-local-emergency-store",
  "openstack-keystone-storage-api",
@@ -5856,11 +5867,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "openstack-keystone-service-grant-driver-raft"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "inventory",
+ "openstack-keystone-core",
+ "openstack-keystone-core-types",
+ "openstack-keystone-distributed-storage",
+ "rmp-serde",
+ "serde",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "openstack-keystone-storage-api"
 version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "openstack-keystone-common",
  "rmp-serde",
  "serde",
  "serde_bytes",
@@ -9535,6 +9563,7 @@ dependencies = [
  "openstack-keystone-identity-driver-sql",
  "openstack-keystone-key-repository",
  "openstack-keystone-oauth2-session-driver-raft",
+ "openstack-keystone-service-grant-driver-raft",
  "openstack-keystone-storage-api",
  "openstack-keystone-token-driver-fernet",
  "openstack-keystone-trust-driver-sql",
