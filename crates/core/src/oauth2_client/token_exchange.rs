@@ -21,7 +21,6 @@
 //! reflects the presented credential's own delegation, per security.md I2
 //! (the delegation boundary is the credential's own immutable project, not
 //! the request's current scope).
-use openstack_keystone_api_types::webauthn::credential_protection_policy;
 use openstack_keystone_core_types::auth::{AuthenticationContext, IdentityInfo, ScopeInfo};
 use openstack_keystone_core_types::oauth2_client::{
     Audience, DelegationContext, OAuth2ClientResource, OpenStackAccessTokenClaims,
