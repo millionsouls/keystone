@@ -251,7 +251,6 @@ async fn test_token_exchange_rejects_cross_domain_subject_token() -> Result<()> 
 
     let (vsc, delegation, credential_expiration) =
         validate_subject_token(&state, &subject_token_a).await?;
-    // ...rest unchanged
     let issuer_b = format!("https://ks.example/v4/oauth2/{}", domain_b.id);
     let err = build_token_exchange_claims(
         &client_b,

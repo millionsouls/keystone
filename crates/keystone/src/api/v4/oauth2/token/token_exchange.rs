@@ -131,7 +131,7 @@ pub(super) async fn handle_token_exchange_grant(
                 )
             }
             TokenExchangeError::CredentialChainExpired => {
-                tracing::warn!(error = %e, "subject_token or application credential chain is already expireed or expires too soon");
+                tracing::warn!(error = %e, "subject_token or application credential chain is already expired or expires too soon");
                 Oauth2TokenError::invalid_grant(
                     "subject_token or application credential expiry does not permit token exchange",
                 )

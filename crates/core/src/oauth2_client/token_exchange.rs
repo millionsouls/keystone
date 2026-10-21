@@ -146,10 +146,10 @@ pub async fn validate_subject_token(
         .validate_to_context(&exec, subject_token, Some(false), None)
         .await?;
 
-    let (delegation_context, credenial_expiration) =
+    let (delegation_context, credential_expiration) =
         derive_delegation_context(vsc.inner().authentication_context())?;
 
-    Ok((vsc, delegation_context, credenial_expiration))
+    Ok((vsc, delegation_context, credential_expiration))
 }
 
 /// Build the [`OpenStackAccessTokenClaims`] for a Token Exchange grant, from
