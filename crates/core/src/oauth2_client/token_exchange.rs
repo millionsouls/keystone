@@ -61,7 +61,7 @@ pub enum TokenExchangeError {
     MissingSubjectTokenExpiry,
 
     /// The credential-chain expiry is not later than the new token's issue time.
-    /// Subject token/ App Cred has either already expired or expires at/before the new token's issue time
+    /// Subject token/App Cred has either already expired or expires at/before the new token's issue time.
     #[error("credential-chain expiry does not leave a positive token lifetime")]
     CredentialChainExpired,
 
