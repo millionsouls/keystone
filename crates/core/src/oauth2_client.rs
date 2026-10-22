@@ -20,8 +20,10 @@
 pub mod backend;
 pub mod crypto;
 pub mod dpop;
+pub mod dpop_mode;
 pub mod dpop_nonce;
 pub mod dpop_replay;
+pub mod dpop_runtime;
 pub mod error;
 pub mod hook;
 pub mod id_token;

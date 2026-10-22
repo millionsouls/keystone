@@ -194,6 +194,10 @@ pub struct PreAuthSession {
     /// be used to skip the consent page.
     #[serde(default)]
     pub force_consent: bool,
+    /// RFC 9449 §10 `dpop_jkt` of the `/authorize` request: the thumbprint of
+    /// the key the authorization code is bound to (ADR 0043 §3).
+    #[serde(default)]
+    pub dpop_jkt: Option<String>,
 }
 
 /// Input to create a new [`PreAuthSession`].
@@ -226,6 +230,9 @@ pub struct PreAuthSessionCreate {
     pub created_at: i64,
     /// UTC epoch seconds.
     pub expires_at: i64,
+    /// `dpop_jkt` of the `/authorize` request (ADR 0043 §3).
+    #[serde(default)]
+    pub dpop_jkt: Option<String>,
 }
 
 /// Single-use authorization code minted on successful consent (RFC 6749
@@ -426,6 +433,9 @@ pub enum RefreshTokenRevocationReason {
     ConsentRevoked,
     /// The user logged out of the client (RP-initiated logout).
     Logout,
+    /// A valid DPoP proof from a key other than the one the family is bound
+    /// to was presented: a suspected stolen refresh token (ADR 0043 §3).
+    DpopKeyMismatch,
 }
 
 impl RefreshTokenRevocationReason {
@@ -445,6 +455,7 @@ impl RefreshTokenRevocationReason {
             Self::PasswordChanged => "password_changed",
             Self::ConsentRevoked => "consent_revoked",
             Self::Logout => "logout",
+            Self::DpopKeyMismatch => "dpop_key_mismatch",
         }
     }
 }
