@@ -11,6 +11,7 @@
 // limitations under the License.
 //
 // SPDX-License-Identifier: Apache-2.0
+// Crypto inventory: TOK-5; see doc/src/contributor/crypto-inventory.md
 //! ADR 0025 Phase 1 (PR 1.2): dispatch a `POST /v3/auth/tokens` request
 //! naming an unrecognized `identity.<method>` to a loaded `mode = full_auth`
 //! dynamic auth plugin's `authenticate` entry point.
@@ -39,7 +40,7 @@ use openstack_keystone_core_types::mapping::resolution::IdentitySource;
 use crate::auth::ExecutionContext;
 use cadf::{Outcome, OutcomeReason};
 
-use crate::auth_plugin::{emit_wasm_plugin_audit, emit_wasm_route_audit};
+use crate::auth_plugin::{RouteAudit, emit_wasm_plugin_audit, emit_wasm_route_audit};
 use crate::keystone::ServiceState;
 use crate::net::resolve_client_ip;
 
@@ -755,10 +756,12 @@ pub async fn route_via_wasm_plugin(
             correlation_id,
             plugin_name,
             methods,
-            "rate_limited",
-            Outcome::Failure,
-            None,
-            Some(OutcomeReason::literal(bound.as_str())),
+            RouteAudit {
+                decision: "rate_limited",
+                outcome: Outcome::Failure,
+                target_method: None,
+                reason: Some(OutcomeReason::literal(bound.as_str())),
+            },
         )
         .await;
         return Err(WasmPluginAuthError::RateLimited(
@@ -772,10 +775,12 @@ pub async fn route_via_wasm_plugin(
             correlation_id,
             plugin_name,
             methods,
-            "rate_limited",
-            Outcome::Failure,
-            None,
-            Some(OutcomeReason::literal(bound.as_str())),
+            RouteAudit {
+                decision: "rate_limited",
+                outcome: Outcome::Failure,
+                target_method: None,
+                reason: Some(OutcomeReason::literal(bound.as_str())),
+            },
         )
         .await;
         return Err(WasmPluginAuthError::RateLimited(
@@ -791,10 +796,12 @@ pub async fn route_via_wasm_plugin(
                 correlation_id,
                 plugin_name,
                 methods,
-                "rate_limited",
-                Outcome::Failure,
-                None,
-                Some(OutcomeReason::literal(bound.as_str())),
+                RouteAudit {
+                    decision: "rate_limited",
+                    outcome: Outcome::Failure,
+                    target_method: None,
+                    reason: Some(OutcomeReason::literal(bound.as_str())),
+                },
             )
             .await;
             return Err(WasmPluginAuthError::RateLimited(
@@ -846,10 +853,12 @@ pub async fn route_via_wasm_plugin(
                 correlation_id,
                 plugin_name,
                 methods,
-                "failure",
-                Outcome::Failure,
-                None,
-                Some(OutcomeReason::literal("InvokeFailed")),
+                RouteAudit {
+                    decision: "failure",
+                    outcome: Outcome::Failure,
+                    target_method: None,
+                    reason: Some(OutcomeReason::literal("InvokeFailed")),
+                },
             )
             .await;
             return Err(WasmPluginAuthError::InvokeFailed(e.to_string()));
@@ -866,10 +875,12 @@ pub async fn route_via_wasm_plugin(
                 correlation_id,
                 plugin_name,
                 methods,
-                "failure",
-                Outcome::Failure,
-                None,
-                Some(OutcomeReason::literal("MalformedResponse")),
+                RouteAudit {
+                    decision: "failure",
+                    outcome: Outcome::Failure,
+                    target_method: None,
+                    reason: Some(OutcomeReason::literal("MalformedResponse")),
+                },
             )
             .await;
             return Err(WasmPluginAuthError::MalformedResponse(e.to_string()));
@@ -883,10 +894,12 @@ pub async fn route_via_wasm_plugin(
                 correlation_id,
                 plugin_name,
                 methods,
-                "passthrough",
-                Outcome::Success,
-                None,
-                None,
+                RouteAudit {
+                    decision: "passthrough",
+                    outcome: Outcome::Success,
+                    target_method: None,
+                    reason: None,
+                },
             )
             .await;
             Ok(RouteDecision {
@@ -904,10 +917,12 @@ pub async fn route_via_wasm_plugin(
                     correlation_id,
                     plugin_name,
                     methods,
-                    "failure",
-                    Outcome::Failure,
-                    Some(&target_method),
-                    Some(OutcomeReason::literal("TargetNotAllowed")),
+                    RouteAudit {
+                        decision: "failure",
+                        outcome: Outcome::Failure,
+                        target_method: Some(&target_method),
+                        reason: Some(OutcomeReason::literal("TargetNotAllowed")),
+                    },
                 )
                 .await;
                 return Err(WasmPluginAuthError::MalformedResponse(format!(
@@ -919,10 +934,12 @@ pub async fn route_via_wasm_plugin(
                 correlation_id,
                 plugin_name,
                 methods,
-                "route",
-                Outcome::Success,
-                Some(&target_method),
-                None,
+                RouteAudit {
+                    decision: "route",
+                    outcome: Outcome::Success,
+                    target_method: Some(&target_method),
+                    reason: None,
+                },
             )
             .await;
             Ok(RouteDecision {
@@ -936,10 +953,12 @@ pub async fn route_via_wasm_plugin(
                 correlation_id,
                 plugin_name,
                 methods,
-                "deny",
-                Outcome::Failure,
-                None,
-                Some(OutcomeReason::literal("PluginDenied")),
+                RouteAudit {
+                    decision: "deny",
+                    outcome: Outcome::Failure,
+                    target_method: None,
+                    reason: Some(OutcomeReason::literal("PluginDenied")),
+                },
             )
             .await;
             Err(WasmPluginAuthError::Denied(reason))

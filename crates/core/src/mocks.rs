@@ -132,12 +132,31 @@ mod oauth2_client {
                 confidential: bool,
             ) -> Result<(OAuth2ClientResource, Option<String>), Oauth2ClientProviderError>;
 
+            async fn delete<'a>(
+                &self,
+                ctx: &ExecutionContext<'a>,
+                domain_id: &'a str,
+                provider_id: &'a str,
+            ) -> Result<(OAuth2ClientResource, usize), Oauth2ClientProviderError>;
+
+            async fn delete_domain_settings<'a>(
+                &self,
+                ctx: &ExecutionContext<'a>,
+                domain_id: &'a str,
+            ) -> Result<(), Oauth2ClientProviderError>;
+
             async fn get<'a>(
                 &self,
                 ctx: &ExecutionContext<'a>,
                 domain_id: &'a str,
                 provider_id: &'a str,
             ) -> Result<Option<OAuth2ClientResource>, Oauth2ClientProviderError>;
+
+            async fn get_domain_settings<'a>(
+                &self,
+                ctx: &ExecutionContext<'a>,
+                domain_id: &'a str,
+            ) -> Result<OAuth2DomainSettings, Oauth2ClientProviderError>;
 
             async fn get_by_client_id<'a>(
                 &self,
@@ -149,6 +168,11 @@ mod oauth2_client {
                 &self,
                 ctx: &ExecutionContext<'a>,
                 params: &OAuth2ClientResourceListParameters,
+            ) -> Result<Vec<OAuth2ClientResource>, Oauth2ClientProviderError>;
+
+            async fn list_delegatable<'a>(
+                &self,
+                ctx: &ExecutionContext<'a>,
             ) -> Result<Vec<OAuth2ClientResource>, Oauth2ClientProviderError>;
 
             async fn update<'a>(
@@ -166,16 +190,74 @@ mod oauth2_client {
                 provider_id: &'a str,
             ) -> Result<(OAuth2ClientResource, String), Oauth2ClientProviderError>;
 
-            async fn delete<'a>(
+            async fn update_domain_settings<'a>(
                 &self,
                 ctx: &ExecutionContext<'a>,
                 domain_id: &'a str,
-                provider_id: &'a str,
-            ) -> Result<(OAuth2ClientResource, usize), Oauth2ClientProviderError>;
+                data: OAuth2DomainSettingsUpdate,
+            ) -> Result<OAuth2DomainSettings, Oauth2ClientProviderError>;
         }
     }
 }
 pub use oauth2_client::MockOauth2ClientProvider;
+
+mod service_grant {
+    use super::*;
+
+    use openstack_keystone_core_types::service_grant::*;
+
+    use crate::auth::ExecutionContext;
+    use crate::service_grant::{ServiceGrantApi, ServiceGrantProviderError};
+
+    mock! {
+        pub ServiceGrantProvider {}
+
+        #[async_trait]
+        impl ServiceGrantApi for ServiceGrantProvider {
+            async fn create_service_grant<'a>(
+                &self,
+                ctx: &ExecutionContext<'a>,
+                data: ServiceGrantCreate,
+            ) -> Result<ServiceGrant, ServiceGrantProviderError>;
+
+            async fn delete_service_grant<'a>(
+                &self,
+                ctx: &ExecutionContext<'a>,
+                domain_id: &'a str,
+                id: &'a str,
+            ) -> Result<(), ServiceGrantProviderError>;
+
+            async fn get_service_grant<'a>(
+                &self,
+                ctx: &ExecutionContext<'a>,
+                domain_id: &'a str,
+                id: &'a str,
+            ) -> Result<Option<ServiceGrant>, ServiceGrantProviderError>;
+
+            async fn get_service_grant_by_id<'a>(
+                &self,
+                ctx: &ExecutionContext<'a>,
+                id: &'a str,
+            ) -> Result<Option<ServiceGrant>, ServiceGrantProviderError>;
+
+            async fn list_service_grants<'a>(
+                &self,
+                ctx: &ExecutionContext<'a>,
+                params: &ServiceGrantListParameters,
+            ) -> Result<Vec<ServiceGrant>, ServiceGrantProviderError>;
+
+            async fn update_service_grant<'a>(
+                &self,
+                ctx: &ExecutionContext<'a>,
+                domain_id: &'a str,
+                id: &'a str,
+                update: ServiceGrantUpdate,
+                expected_version: u64,
+            ) -> Result<ServiceGrant, ServiceGrantProviderError>;
+        }
+    }
+}
+pub use service_grant::MockServiceGrantProvider;
 
 mod oauth2_key {
     use super::*;

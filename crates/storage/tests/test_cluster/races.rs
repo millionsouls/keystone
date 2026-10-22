@@ -40,7 +40,7 @@ const PREFIX_INDEX_RACE_PORT_BASE: u16 = 300;
 
 #[allow(unsafe_code)]
 async fn test_prefix_index_leader_race_concurrent_inner() -> Result<()> {
-    let provider = rustls::crypto::aws_lc_rs::default_provider();
+    let provider = openstack_keystone_tls_provider::provider();
     let _ = rustls::crypto::CryptoProvider::install_default(provider);
 
     let tls_configuration = make_certificates()?;
@@ -108,6 +108,7 @@ async fn test_prefix_index_leader_race_concurrent_inner() -> Result<()> {
         .change_membership(pb::raft::ChangeMembershipRequest {
             members: vec![1, 2, 3],
             retain: false,
+            remove_learners: Vec::new(),
         })
         .await?;
 
@@ -300,7 +301,7 @@ const GET_BY_KEY_PORT_BASE: u16 = 100;
 
 #[allow(unsafe_code)]
 async fn test_replication_race_get_by_key_inner() -> Result<()> {
-    let provider = rustls::crypto::aws_lc_rs::default_provider();
+    let provider = openstack_keystone_tls_provider::provider();
     let _ = rustls::crypto::CryptoProvider::install_default(provider);
 
     let tls_configuration = make_certificates()?;
@@ -364,6 +365,7 @@ async fn test_replication_race_get_by_key_inner() -> Result<()> {
         .change_membership(pb::raft::ChangeMembershipRequest {
             members: vec![1, 2, 3],
             retain: false,
+            remove_learners: Vec::new(),
         })
         .await?;
 
@@ -473,7 +475,7 @@ const DELETE_STALE_PORT_BASE: u16 = 200;
 
 #[allow(unsafe_code)]
 async fn test_replication_race_delete_stale_inner() -> Result<()> {
-    let provider = rustls::crypto::aws_lc_rs::default_provider();
+    let provider = openstack_keystone_tls_provider::provider();
     let _ = rustls::crypto::CryptoProvider::install_default(provider);
 
     let tls_configuration = make_certificates()?;
@@ -537,6 +539,7 @@ async fn test_replication_race_delete_stale_inner() -> Result<()> {
         .change_membership(pb::raft::ChangeMembershipRequest {
             members: vec![1, 2, 3],
             retain: false,
+            remove_learners: Vec::new(),
         })
         .await?;
 

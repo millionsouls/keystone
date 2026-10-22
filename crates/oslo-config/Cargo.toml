@@ -11,9 +11,15 @@ homepage.workspace = true
 exclude.workspace = true
 
 [features]
-default = ["vault"]
+default = []
 # Resolution of `vault://` references and the `[vault]` section.
-vault = ["dep:serde_json", "dep:thiserror", "dep:url", "dep:vaultrs"]
+vault = [
+  "dep:openstack-keystone-tls-provider",
+  "dep:serde_json",
+  "dep:thiserror",
+  "dep:url",
+  "dep:vaultrs",
+]
 
 [dependencies]
 chrono = { workspace = true, features = ["now", "serde"] }
@@ -22,7 +28,8 @@ derive_builder.workspace = true
 eyre.workspace = true
 inventory.workspace = true
 ipnet = { workspace = true }
-notify = "8.2"
+notify.workspace = true
+openstack-keystone-tls-provider = { workspace = true, optional = true }
 secrecy = { workspace = true, features = ["serde"] }
 serde_json = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"] }

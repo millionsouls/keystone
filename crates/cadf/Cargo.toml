@@ -12,14 +12,13 @@ repository.workspace = true
 arc-swap.workspace = true
 async-trait.workspace = true
 chrono = { workspace = true, features = ["serde", "now"] }
-getrandom.workspace = true
-hmac.workspace = true
-hkdf.workspace = true
+aws-lc-rs = { workspace = true, optional = true }
 openstack-keystone-telemetry.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
-sha2.workspace = true
-rustls = { workspace = true, features = ["aws-lc-rs"], optional = true }
+ring = { workspace = true, optional = true }
+openstack-keystone-tls-provider = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
 rustls-native-certs = { workspace = true, optional = true }
 rustls-pki-types = { workspace = true, features = ["std"], optional = true }
 thiserror.workspace = true
@@ -30,13 +29,21 @@ tracing.workspace = true
 uuid = { workspace = true, features = ["v4"] }
 
 [features]
-default = []
+default = ["ring"]
+# `ring` primitives (HMAC-SHA256, HKDF-SHA256, RNG).
+ring = ["dep:ring"]
+# Route HMAC, HKDF and RNG through the FIPS 140-3 validated AWS-LC module.
+# Takes precedence over `ring`. Building it needs cmake, a C compiler, clang
+# (bindgen) and Go. Build with `--no-default-features --features fips` to keep
+# `ring` out of this crate.
+fips = ["dep:aws-lc-rs", "aws-lc-rs/fips"]
 testing = []
 # Service bootstrap: KEK load/generate, spool sealing, writer, shipper and
 # key reloader (`cadf::runtime::init`).
 runtime = ["dep:tokio-util"]
 # RFC 5424 syslog sink over TCP, optionally wrapped in TLS.
 syslog = [
+    "dep:openstack-keystone-tls-provider",
     "dep:rustls",
     "dep:rustls-native-certs",
     "dep:rustls-pki-types",
@@ -45,6 +52,7 @@ syslog = [
 ]
 
 [dev-dependencies]
+openstack-keystone-tls-provider.workspace = true
 openstack-keystone-telemetry = { workspace = true, features = ["golden"] }
 nix = { workspace = true, features = ["user"] }
 rcgen.workspace = true

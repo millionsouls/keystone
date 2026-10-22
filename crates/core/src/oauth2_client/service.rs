@@ -61,6 +61,8 @@ pub(crate) const RESERVED_CLAIM_NAMES: &[&str] = &[
     "delegation_context",
     "auth_method",
     "delegated_project_id",
+    "act",
+    "grant_id",
     "token_use",
     "openstack_context",
     "user_id",
@@ -73,6 +75,10 @@ pub(crate) const RESERVED_CLAIM_NAMES: &[&str] = &[
     "system_id",
     "roles",
 ];
+
+/// `provider_id` of the audit event for the per-domain settings, which are
+/// not tied to one client registration.
+const DOMAIN_SETTINGS_TARGET: &str = "domain-settings";
 
 /// Build the audit event for an operation on one client registration. The
 /// payload carries IDs only, never the secret or its hash.
@@ -274,6 +280,22 @@ fn validate_display(
     Ok(())
 }
 
+/// Reject `dpop_bound_access_tokens = true` until the token endpoints bind
+/// issued tokens to the proof key (ADR 0043 §3). The flag is stored and
+/// returned already, but accepting `true` now would promise a
+/// sender-constrained client that still receives plain bearer tokens.
+/// Remove once enforcement lands.
+fn validate_dpop_bound_access_tokens(requested: bool) -> Result<(), Oauth2ClientProviderError> {
+    if requested {
+        return Err(Oauth2ClientProviderError::Validation(
+            "dpop_bound_access_tokens=true is not supported yet: DPoP binding of issued \
+             tokens is not enforced"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Validate the PKCE requirement (ADR 0026 §5): mandatory for public
 /// clients.
 fn validate_require_pkce(
@@ -288,12 +310,177 @@ fn validate_require_pkce(
     Ok(())
 }
 
+/// Token endpoint authentication method of delegatable service clients:
+/// mutual TLS with a SPIFFE X.509-SVID (ADR 0036 §3.1).
+pub const TLS_CLIENT_AUTH: &str = "tls_client_auth";
+
+/// Upper bound on `delegation.max_role_ids`.
+const MAX_DELEGATION_ROLE_IDS: usize = 64;
+
+/// Validate the delegation registration of a client (ADR 0036 §3, §3.1) on
+/// its effective state.
+///
+/// A client with `spiffe_ids` or a `delegation` policy must authenticate
+/// with `tls_client_auth`; a delegation policy needs at least one SPIFFE ID
+/// pattern; `on_behalf_of` needs `max_operation_lifetime`.
+///
+/// Patterns are checked against `trust_domains` (the internal interface's
+/// trust domains, i.e. the deployment's own) only when `check_patterns` is
+/// set, i.e. when the write changes them. Otherwise a later change of the
+/// deployment's trust domains would block every edit of a stored client,
+/// including disabling it.
+fn validate_delegation(
+    token_endpoint_auth_method: &str,
+    spiffe_ids: &[String],
+    delegation: Option<&DelegationPolicy>,
+    trust_domains: &[String],
+    check_patterns: bool,
+) -> Result<(), Oauth2ClientProviderError> {
+    let validation = |msg: String| Oauth2ClientProviderError::Validation(msg);
+    if (delegation.is_some() || !spiffe_ids.is_empty())
+        && token_endpoint_auth_method != TLS_CLIENT_AUTH
+    {
+        return Err(validation(format!(
+            "spiffe_ids and delegation require token_endpoint_auth_method `{TLS_CLIENT_AUTH}`"
+        )));
+    }
+    if token_endpoint_auth_method == TLS_CLIENT_AUTH && spiffe_ids.is_empty() {
+        return Err(validation(format!(
+            "token_endpoint_auth_method `{TLS_CLIENT_AUTH}` requires spiffe_ids"
+        )));
+    }
+    if check_patterns {
+        for pattern in spiffe_ids {
+            validate_spiffe_id_pattern(pattern, trust_domains).map_err(validation)?;
+        }
+    }
+    if let Some(delegation) = delegation {
+        if delegation.on_behalf_of && delegation.max_operation_lifetime.is_none() {
+            return Err(validation(
+                "delegation.on_behalf_of requires delegation.max_operation_lifetime".to_string(),
+            ));
+        }
+        if delegation.max_grant_lifetime == Some(0)
+            || delegation.max_operation_lifetime == Some(0)
+            || delegation.max_grants_per_project == Some(0)
+        {
+            return Err(validation(
+                "delegation lifetimes and limits must be positive".to_string(),
+            ));
+        }
+        if delegation.max_role_ids.len() > MAX_DELEGATION_ROLE_IDS {
+            return Err(validation(format!(
+                "delegation.max_role_ids must not have more than {MAX_DELEGATION_ROLE_IDS} entries"
+            )));
+        }
+        if delegation.max_role_ids.iter().any(|r| r.trim().is_empty()) {
+            return Err(validation(
+                "delegation.max_role_ids must not contain empty ids".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Reject `max_role_ids` entries that are not existing roles (ADR 0036
+/// §3): a ceiling naming a role that does not exist would silently
+/// delegate less than the registrant meant (a typo, or a role later
+/// recreated under another id).
+///
+/// Ids in `unchanged` (the stored ceiling) are skipped: a role deleted
+/// since registration must not block an edit that leaves it in place.
+async fn ensure_roles_exist(
+    ctx: &ExecutionContext<'_>,
+    delegation: Option<&DelegationPolicy>,
+    unchanged: &[String],
+) -> Result<(), Oauth2ClientProviderError> {
+    let Some(delegation) = delegation else {
+        return Ok(());
+    };
+    let roles = ctx.state().provider.get_role_provider();
+    for role_id in delegation
+        .max_role_ids
+        .iter()
+        .filter(|id| !unchanged.contains(id))
+    {
+        if roles
+            .get_role(ctx, role_id)
+            .await
+            .map_err(|e| Oauth2ClientProviderError::Dependency(e.to_string()))?
+            .is_none()
+        {
+            return Err(Oauth2ClientProviderError::Validation(format!(
+                "delegation.max_role_ids names an unknown role: {role_id}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// A `tls_client_auth` client has no secret and is exempt from the PKCE
+/// rule, so it must not use the browser and device grants, which rely on
+/// one of the two to bind the code to the client. Without those grants,
+/// redirect URIs are meaningless.
+fn validate_mtls_client(
+    grant_types: &[GrantType],
+    redirect_uris: &[String],
+) -> Result<(), Oauth2ClientProviderError> {
+    if !redirect_uris.is_empty() {
+        return Err(Oauth2ClientProviderError::Validation(format!(
+            "a `{TLS_CLIENT_AUTH}` client cannot have redirect_uris"
+        )));
+    }
+    if grant_types
+        .iter()
+        .any(|g| matches!(g, GrantType::AuthorizationCode | GrantType::DeviceCode))
+    {
+        return Err(Oauth2ClientProviderError::Validation(format!(
+            "a `{TLS_CLIENT_AUTH}` client cannot use the authorization_code or device_code grant"
+        )));
+    }
+    Ok(())
+}
+
+/// SPIFFE trust domains of the internal interface, the only interface a
+/// delegatable service authenticates on. Empty when the interface is not
+/// configured with a SPIFFE listener.
+fn internal_trust_domains(config: &Config) -> Vec<String> {
+    match config.interface_internal.as_ref().map(|i| &i.listener) {
+        Some(openstack_keystone_config::ListenerConfig::Spiffe(spiffe)) => {
+            spiffe.trust_domains.clone()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// First of `candidates` overlapping a pattern of a different live client.
+fn find_spiffe_conflict(
+    candidates: &[String],
+    existing: &[OAuth2ClientResource],
+    own: Option<(&str, &str)>,
+) -> Option<String> {
+    existing
+        .iter()
+        .filter(|c| own != Some((c.domain_id.as_str(), c.provider_id.as_str())))
+        .flat_map(|c| c.spiffe_ids.iter())
+        .find_map(|theirs| {
+            candidates
+                .iter()
+                .find(|mine| spiffe_id_patterns_overlap(mine, theirs))
+                .map(|mine| {
+                    format!("spiffe_ids pattern `{mine}` overlaps `{theirs}` of another client")
+                })
+        })
+}
+
 /// OAuth2 client Provider.
 pub struct Oauth2ClientService {
     /// Backend driver.
     backend_driver: Arc<dyn Oauth2ClientBackend>,
     /// `[oauth2]` config, for client secret Argon2id parameters.
     oauth2_config: openstack_keystone_config::Oauth2Provider,
+    /// Trust domains SPIFFE ID patterns may name (ADR 0036 §3.1).
+    internal_trust_domains: Vec<String>,
 }
 
 impl Oauth2ClientService {
@@ -308,6 +495,7 @@ impl Oauth2ClientService {
         Ok(Self {
             backend_driver,
             oauth2_config: config.oauth2.clone(),
+            internal_trust_domains: internal_trust_domains(config),
         })
     }
 }
@@ -321,8 +509,25 @@ impl Oauth2ClientApi for Oauth2ClientService {
         data: OAuth2ClientResourceCreate,
         confidential: bool,
     ) -> Result<(OAuth2ClientResource, Option<String>), Oauth2ClientProviderError> {
+        validate_delegation(
+            &data.token_endpoint_auth_method,
+            &data.spiffe_ids,
+            data.delegation.as_ref(),
+            &self.internal_trust_domains,
+            true,
+        )?;
+        validate_dpop_bound_access_tokens(data.dpop_bound_access_tokens)?;
+        ensure_roles_exist(ctx, data.delegation.as_ref(), &[]).await?;
+        // A `tls_client_auth` client authenticates with its SVID: it never
+        // gets a secret and is exempt from the PKCE rule.
+        let mtls = data.token_endpoint_auth_method == TLS_CLIENT_AUTH;
+        let confidential = confidential && !mtls;
         validate_redirect_uris(&data.redirect_uris, confidential)?;
-        validate_require_pkce(data.require_pkce, confidential)?;
+        if mtls {
+            validate_mtls_client(&data.grant_types, &data.redirect_uris)?;
+        } else {
+            validate_require_pkce(data.require_pkce, confidential)?;
+        }
         validate_post_logout_redirect_uris(&data.post_logout_redirect_uris, confidential)?;
         validate_logout_endpoint(
             "backchannel_logout_uri",
@@ -343,6 +548,13 @@ impl Oauth2ClientApi for Oauth2ClientService {
             data.tos_uri.as_deref(),
             Some(&data.contacts),
         )?;
+
+        if !data.spiffe_ids.is_empty() {
+            let existing = self.backend_driver.list_spiffe_clients(ctx.state()).await?;
+            if let Some(msg) = find_spiffe_conflict(&data.spiffe_ids, &existing, None) {
+                return Err(Oauth2ClientProviderError::Conflict(msg));
+            }
+        }
 
         let mut data = data;
         data.client_id = uuid::Uuid::new_v4().to_string();
@@ -399,6 +611,22 @@ impl Oauth2ClientApi for Oauth2ClientService {
         }
     }
 
+    #[tracing::instrument(name = "provider.oauth2_client.delete_domain_settings", level = "debug", skip_all, fields(domain_id = %domain_id))]
+    async fn delete_domain_settings<'a>(
+        &self,
+        ctx: &ExecutionContext<'a>,
+        domain_id: &'a str,
+    ) -> Result<(), Oauth2ClientProviderError> {
+        let op = self
+            .backend_driver
+            .delete_domain_settings(ctx.state(), domain_id);
+        crate::audited_if_ctx! {
+            ctx: ctx,
+            event: oauth2_client_event(Operation::Delete, domain_id, DOMAIN_SETTINGS_TARGET),
+            operation: op,
+            on_audit_error: |_: AuditDispatchError| Oauth2ClientProviderError::AuditUnavailable,
+        }
+    }
     #[tracing::instrument(name = "provider.oauth2_client.get", level = "debug", skip_all, fields(domain_id = %domain_id, provider_id = %provider_id))]
     async fn get<'a>(
         &self,
@@ -409,6 +637,19 @@ impl Oauth2ClientApi for Oauth2ClientService {
         self.backend_driver
             .get(ctx.state(), domain_id, provider_id)
             .await
+    }
+
+    #[tracing::instrument(name = "provider.oauth2_client.get_domain_settings", level = "debug", skip_all, fields(domain_id = %domain_id))]
+    async fn get_domain_settings<'a>(
+        &self,
+        ctx: &ExecutionContext<'a>,
+        domain_id: &'a str,
+    ) -> Result<OAuth2DomainSettings, Oauth2ClientProviderError> {
+        Ok(self
+            .backend_driver
+            .get_domain_settings(ctx.state(), domain_id)
+            .await?
+            .unwrap_or_else(|| OAuth2DomainSettings::default_for(domain_id)))
     }
 
     #[tracing::instrument(name = "provider.oauth2_client.get_by_client_id", level = "debug", skip_all, fields(client_id = %client_id))]
@@ -429,6 +670,18 @@ impl Oauth2ClientApi for Oauth2ClientService {
         params: &OAuth2ClientResourceListParameters,
     ) -> Result<Vec<OAuth2ClientResource>, Oauth2ClientProviderError> {
         self.backend_driver.list(ctx.state(), params).await
+    }
+
+    #[tracing::instrument(
+        name = "provider.oauth2_client.list_delegatable",
+        level = "debug",
+        skip_all
+    )]
+    async fn list_delegatable<'a>(
+        &self,
+        ctx: &ExecutionContext<'a>,
+    ) -> Result<Vec<OAuth2ClientResource>, Oauth2ClientProviderError> {
+        self.backend_driver.list_delegatable(ctx.state()).await
     }
 
     #[tracing::instrument(name = "provider.oauth2_client.rotate_secret", level = "debug", skip_all, fields(domain_id = %domain_id, provider_id = %provider_id))]
@@ -495,7 +748,45 @@ impl Oauth2ClientApi for Oauth2ClientService {
                 "cannot update a revoked (soft-deleted) OAuth2 client".to_string(),
             ));
         }
+        validate_dpop_bound_access_tokens(data.dpop_bound_access_tokens.unwrap_or(false))?;
         let confidential = current.client_secret_hash.is_some();
+        let mtls = current.token_endpoint_auth_method == TLS_CLIENT_AUTH;
+        if data.remove_delegation && data.delegation.is_some() {
+            return Err(Oauth2ClientProviderError::Validation(
+                "delegation and remove_delegation are mutually exclusive".to_string(),
+            ));
+        }
+        validate_delegation(
+            &current.token_endpoint_auth_method,
+            data.spiffe_ids.as_deref().unwrap_or(&current.spiffe_ids),
+            if data.remove_delegation {
+                None
+            } else {
+                data.delegation.as_ref().or(current.delegation.as_ref())
+            },
+            &self.internal_trust_domains,
+            data.spiffe_ids.is_some(),
+        )?;
+        // Only role ids this update adds are checked: one already in the
+        // stored ceiling may name a role deleted since, which must not
+        // block unrelated edits.
+        if !data.remove_delegation {
+            let stored = current
+                .delegation
+                .as_ref()
+                .map_or(&[][..], |d| d.max_role_ids.as_slice());
+            ensure_roles_exist(ctx, data.delegation.as_ref(), stored).await?;
+        }
+        if let Some(spiffe_ids) = data.spiffe_ids.as_deref().filter(|ids| !ids.is_empty()) {
+            let existing = self.backend_driver.list_spiffe_clients(ctx.state()).await?;
+            if let Some(msg) = find_spiffe_conflict(
+                spiffe_ids,
+                &existing,
+                Some((&current.domain_id, &current.provider_id)),
+            ) {
+                return Err(Oauth2ClientProviderError::Conflict(msg));
+            }
+        }
 
         if let Some(redirect_uris) = &data.redirect_uris {
             validate_redirect_uris(redirect_uris, confidential)?;
@@ -522,7 +813,16 @@ impl Oauth2ClientApi for Oauth2ClientService {
             validate_post_logout_redirect_uris(uris, confidential)?;
         }
         let effective_pkce = data.require_pkce.unwrap_or(current.require_pkce);
-        validate_require_pkce(effective_pkce, confidential)?;
+        if mtls {
+            validate_mtls_client(
+                data.grant_types.as_deref().unwrap_or(&current.grant_types),
+                data.redirect_uris
+                    .as_deref()
+                    .unwrap_or(&current.redirect_uris),
+            )?;
+        } else {
+            validate_require_pkce(effective_pkce, confidential)?;
+        }
         if let Some(claims_template) = &data.claims_template {
             validate_claims_template(claims_template)?;
         }
@@ -565,6 +865,39 @@ impl Oauth2ClientApi for Oauth2ClientService {
             on_audit_error: |_: AuditDispatchError| Oauth2ClientProviderError::AuditUnavailable,
         }
     }
+
+    #[tracing::instrument(name = "provider.oauth2_client.update_domain_settings", level = "debug", skip_all, fields(domain_id = %domain_id))]
+    async fn update_domain_settings<'a>(
+        &self,
+        ctx: &ExecutionContext<'a>,
+        domain_id: &'a str,
+        data: OAuth2DomainSettingsUpdate,
+    ) -> Result<OAuth2DomainSettings, Oauth2ClientProviderError> {
+        // Settings of an unknown domain would never be cleaned up: the
+        // domain-delete hook only fires for domains that existed.
+        if ctx
+            .state()
+            .provider
+            .get_resource_provider()
+            .get_domain(ctx, domain_id)
+            .await
+            .map_err(|e| Oauth2ClientProviderError::Dependency(e.to_string()))?
+            .is_none()
+        {
+            return Err(Oauth2ClientProviderError::NotFound(format!(
+                "domain {domain_id}"
+            )));
+        }
+        let op = self
+            .backend_driver
+            .update_domain_settings(ctx.state(), domain_id, data);
+        crate::audited_if_ctx! {
+            ctx: ctx,
+            event: oauth2_client_event(Operation::Update, domain_id, DOMAIN_SETTINGS_TARGET),
+            operation: op,
+            on_audit_error: |_: AuditDispatchError| Oauth2ClientProviderError::AuditUnavailable,
+        }
+    }
 }
 
 /// Tombstone every refresh token family of `client_id` (reason
@@ -594,6 +927,7 @@ mod tests {
     use crate::oauth2_session::MockOauth2SessionProvider;
     use crate::provider::Provider;
     use crate::tests::get_mocked_state;
+    use openstack_keystone_core_types::role::RoleBuilder;
     use std::collections::HashMap;
 
     fn sample_create() -> OAuth2ClientResourceCreate {
@@ -603,6 +937,8 @@ mod tests {
             backchannel_logout_session_required: false,
             frontchannel_logout_uri: None,
             frontchannel_logout_session_required: false,
+            spiffe_ids: vec![],
+            delegation: None,
             client_id: String::new(),
             provider_id: "provider-1".into(),
             domain_id: "domain-1".into(),
@@ -620,6 +956,7 @@ mod tests {
             policy_uri: None,
             tos_uri: None,
             contacts: vec![],
+            dpop_bound_access_tokens: false,
         }
     }
 
@@ -632,7 +969,468 @@ mod tests {
                 argon2_parallelism: 1,
                 ..Default::default()
             },
+            internal_trust_domains: vec!["cloud.example".into()],
         }
+    }
+
+    fn sample_service_create() -> OAuth2ClientResourceCreate {
+        let mut req = sample_create();
+        req.token_endpoint_auth_method = TLS_CLIENT_AUTH.into();
+        req.redirect_uris = vec![];
+        req.grant_types = vec![];
+        req.require_pkce = false;
+        req.spiffe_ids = vec!["spiffe://cloud.example/ns/nova/sa/*".into()];
+        req.delegation = Some(DelegationPolicy {
+            service_grants: true,
+            ..Default::default()
+        });
+        req
+    }
+
+    fn state_with_roles(
+        known: &'static [&'static str],
+    ) -> impl std::future::Future<Output = crate::keystone::ServiceState> {
+        let mut roles = crate::role::MockRoleProvider::default();
+        roles.expect_get_role().returning(move |_, id| {
+            Ok(known
+                .contains(&id)
+                .then(|| RoleBuilder::default().id(id).name(id).build().unwrap()))
+        });
+        get_mocked_state(
+            None,
+            Some(crate::provider::Provider::mocked_builder().mock_role(roles)),
+        )
+    }
+
+    #[test]
+    fn test_dpop_bound_access_tokens_true_is_rejected_until_enforced() {
+        assert!(validate_dpop_bound_access_tokens(false).is_ok());
+        assert!(matches!(
+            validate_dpop_bound_access_tokens(true),
+            Err(Oauth2ClientProviderError::Validation(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_create_rejects_unknown_max_role_id() {
+        let mut mock = MockOauth2ClientBackend::new();
+        mock.expect_list_spiffe_clients().returning(|_| Ok(vec![]));
+        mock.expect_create()
+            .returning(|_, data| Ok(sample_resource_from(data)));
+        let service = service_with(mock);
+        let state = state_with_roles(&["member"]).await;
+        let ctx = ExecutionContext::internal(&state);
+
+        let mut req = sample_service_create();
+        req.delegation = Some(DelegationPolicy {
+            service_grants: true,
+            max_role_ids: vec!["member".into(), "membr".into()],
+            ..Default::default()
+        });
+        assert!(matches!(
+            service.create(&ctx, req.clone(), false).await,
+            Err(Oauth2ClientProviderError::Validation(msg)) if msg.contains("membr")
+        ));
+
+        req.delegation = Some(DelegationPolicy {
+            service_grants: true,
+            max_role_ids: vec!["member".into()],
+            ..Default::default()
+        });
+        assert!(service.create(&ctx, req, false).await.is_ok());
+    }
+
+    fn resource_with_ceiling(ids: &[&str]) -> OAuth2ClientResource {
+        let mut req = sample_service_create();
+        req.delegation = Some(DelegationPolicy {
+            service_grants: true,
+            max_role_ids: ids.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        });
+        sample_resource_from(req)
+    }
+
+    fn update_with_ceiling(ids: &[&str]) -> OAuth2ClientResourceUpdate {
+        OAuth2ClientResourceUpdate {
+            delegation: Some(DelegationPolicy {
+                service_grants: true,
+                max_role_ids: ids.iter().map(|s| s.to_string()).collect(),
+                max_grant_lifetime: Some(60),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_checks_only_added_max_role_ids() {
+        let mut mock = MockOauth2ClientBackend::new();
+        // Stored ceiling names `gone`, which no longer exists.
+        mock.expect_get()
+            .returning(|_, _, _| Ok(Some(resource_with_ceiling(&["member", "gone"]))));
+        mock.expect_update()
+            .returning(|_, _, _, _| Ok(resource_with_ceiling(&["member", "gone"])));
+        let service = service_with(mock);
+        let state = state_with_roles(&["member", "reader"]).await;
+        let ctx = ExecutionContext::internal(&state);
+
+        // Same ids, other delegation field changed: not re-checked.
+        assert!(
+            service
+                .update(&ctx, "d", "p", update_with_ceiling(&["member", "gone"]))
+                .await
+                .is_ok()
+        );
+        // A new existing id is accepted.
+        assert!(
+            service
+                .update(&ctx, "d", "p", update_with_ceiling(&["gone", "reader"]))
+                .await
+                .is_ok()
+        );
+        // A new unknown id is rejected.
+        assert!(matches!(
+            service
+                .update(&ctx, "d", "p", update_with_ceiling(&["member", "membr"]))
+                .await,
+            Err(Oauth2ClientProviderError::Validation(msg)) if msg.contains("membr")
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_role_lookup_failure_is_dependency_error() {
+        let mut roles = crate::role::MockRoleProvider::default();
+        roles.expect_get_role().returning(|_, _| {
+            Err(openstack_keystone_core_types::role::RoleProviderError::Driver("boom".into()))
+        });
+        let state = get_mocked_state(
+            None,
+            Some(crate::provider::Provider::mocked_builder().mock_role(roles)),
+        )
+        .await;
+        let ctx = ExecutionContext::internal(&state);
+        let mut req = sample_service_create();
+        req.delegation = Some(DelegationPolicy {
+            service_grants: true,
+            max_role_ids: vec!["member".into()],
+            ..Default::default()
+        });
+        let service = service_with(MockOauth2ClientBackend::new());
+        assert!(matches!(
+            service.create(&ctx, req, false).await,
+            Err(Oauth2ClientProviderError::Dependency(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_create_delegatable_service_has_no_secret() {
+        let mut mock = MockOauth2ClientBackend::new();
+        mock.expect_list_spiffe_clients().returning(|_| Ok(vec![]));
+        mock.expect_create()
+            .returning(|_, data| Ok(sample_resource_from(data)));
+        let service = service_with(mock);
+        let state = get_mocked_state(None, None).await;
+        let ctx = ExecutionContext::internal(&state);
+
+        // Even when the caller asks for a confidential client, an mTLS
+        // client never gets a secret, and PKCE is not required.
+        let (created, secret) = service
+            .create(&ctx, sample_service_create(), true)
+            .await
+            .unwrap();
+        assert!(secret.is_none());
+        assert!(created.client_secret_hash.is_none());
+        assert!(created.service_grant_policy().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_create_rejects_invalid_delegation() {
+        let service = service_with(MockOauth2ClientBackend::new());
+        let state = get_mocked_state(None, None).await;
+        let ctx = ExecutionContext::internal(&state);
+
+        let cases: Vec<fn(&mut OAuth2ClientResourceCreate)> = vec![
+            // Delegation needs tls_client_auth.
+            (|r| r.token_endpoint_auth_method = "client_secret_basic".into()),
+            // ... and SPIFFE ID patterns.
+            (|r| r.spiffe_ids = vec![]),
+            // Foreign trust domain.
+            (|r| r.spiffe_ids = vec!["spiffe://evil.example/ns/nova".into()]),
+            // Wildcard not in the final segment.
+            (|r| r.spiffe_ids = vec!["spiffe://cloud.example/ns/*/sa".into()]),
+            // on_behalf_of without an operation lifetime.
+            (|r| {
+                r.delegation = Some(DelegationPolicy {
+                    on_behalf_of: true,
+                    ..Default::default()
+                })
+            }),
+            // Browser grant without a secret or PKCE.
+            (|r| r.grant_types = vec![GrantType::AuthorizationCode]),
+            // Redirect URIs are meaningless without the browser grants.
+            (|r| r.redirect_uris = vec!["https://rp.example.com/cb".into()]),
+            // Characters outside the SPIFFE ID charset.
+            (|r| r.spiffe_ids = vec!["spiffe://cloud.example/ns/a b".into()]),
+            // Zero limits.
+            (|r| {
+                r.delegation = Some(DelegationPolicy {
+                    service_grants: true,
+                    max_grant_lifetime: Some(0),
+                    ..Default::default()
+                })
+            }),
+        ];
+        for (idx, mutate) in cases.iter().enumerate() {
+            let mut req = sample_service_create();
+            mutate(&mut req);
+            assert!(
+                matches!(
+                    service.create(&ctx, req, false).await,
+                    Err(Oauth2ClientProviderError::Validation(_))
+                ),
+                "case {idx}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_rejects_spiffe_ids_without_internal_interface() {
+        let mut service = service_with(MockOauth2ClientBackend::new());
+        service.internal_trust_domains = vec![];
+        let state = get_mocked_state(None, None).await;
+        let ctx = ExecutionContext::internal(&state);
+        assert!(matches!(
+            service.create(&ctx, sample_service_create(), false).await,
+            Err(Oauth2ClientProviderError::Validation(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_create_rejects_overlapping_spiffe_ids() {
+        let mut mock = MockOauth2ClientBackend::new();
+        mock.expect_list_spiffe_clients().returning(|_| {
+            let mut other = sample_resource_from(sample_service_create());
+            other.spiffe_ids = vec!["spiffe://cloud.example/ns/nova/sa/compute".into()];
+            Ok(vec![other])
+        });
+        let service = service_with(mock);
+        let state = get_mocked_state(None, None).await;
+        let ctx = ExecutionContext::internal(&state);
+
+        // The wildcard covers the other client's exact ID.
+        assert!(matches!(
+            service.create(&ctx, sample_service_create(), false).await,
+            Err(Oauth2ClientProviderError::Conflict(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_update_spiffe_ids_ignores_own_patterns() {
+        let mut mock = MockOauth2ClientBackend::new();
+        mock.expect_get()
+            .returning(|_, _, _| Ok(Some(sample_resource_from(sample_service_create()))));
+        mock.expect_list_spiffe_clients()
+            .returning(|_| Ok(vec![sample_resource_from(sample_service_create())]));
+        mock.expect_update()
+            .returning(|_, _, _, _| Ok(sample_resource_from(sample_service_create())));
+        let service = service_with(mock);
+        let state = get_mocked_state(None, None).await;
+        let ctx = ExecutionContext::internal(&state);
+
+        let update = OAuth2ClientResourceUpdate {
+            spiffe_ids: Some(vec!["spiffe://cloud.example/ns/nova/sa/*".into()]),
+            ..Default::default()
+        };
+        assert!(
+            service
+                .update(&ctx, "domain-1", "provider-1", update)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_domain_settings_defaults_when_not_stored() {
+        let mut mock = MockOauth2ClientBackend::new();
+        mock.expect_get_domain_settings().returning(|_, _| Ok(None));
+        let service = service_with(mock);
+        let state = get_mocked_state(None, None).await;
+        let ctx = ExecutionContext::internal(&state);
+
+        let settings = service.get_domain_settings(&ctx, "domain-1").await.unwrap();
+        assert_eq!(settings.domain_id, "domain-1");
+        assert_eq!(settings.dpop, openstack_keystone_config::DpopMode::Disabled);
+    }
+
+    #[tokio::test]
+    async fn test_get_domain_settings_returns_stored() {
+        let mut mock = MockOauth2ClientBackend::new();
+        mock.expect_get_domain_settings().returning(|_, domain_id| {
+            Ok(Some(OAuth2DomainSettings {
+                domain_id: domain_id.into(),
+                dpop: openstack_keystone_config::DpopMode::Required,
+                updated_at: 5,
+            }))
+        });
+        let service = service_with(mock);
+        let state = get_mocked_state(None, None).await;
+        let ctx = ExecutionContext::internal(&state);
+
+        let settings = service.get_domain_settings(&ctx, "domain-1").await.unwrap();
+        assert_eq!(settings.dpop, openstack_keystone_config::DpopMode::Required);
+    }
+
+    #[tokio::test]
+    async fn test_update_and_delete_domain_settings_delegate_to_backend() {
+        let mut mock = MockOauth2ClientBackend::new();
+        mock.expect_update_domain_settings()
+            .withf(|_, domain_id, data| {
+                domain_id == "domain-1"
+                    && data.dpop == Some(openstack_keystone_config::DpopMode::Optional)
+            })
+            .times(1)
+            .returning(|_, domain_id, data| {
+                Ok(OAuth2DomainSettings::default_for(domain_id).with_update(data, 7))
+            });
+        mock.expect_delete_domain_settings()
+            .withf(|_, domain_id| domain_id == "domain-1")
+            .times(1)
+            .returning(|_, _| Ok(()));
+        let service = service_with(mock);
+        let state = state_with_domains(&["domain-1"]).await;
+        let ctx = ExecutionContext::internal(&state);
+
+        let updated = service
+            .update_domain_settings(
+                &ctx,
+                "domain-1",
+                OAuth2DomainSettingsUpdate {
+                    dpop: Some(openstack_keystone_config::DpopMode::Optional),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.dpop, openstack_keystone_config::DpopMode::Optional);
+        service
+            .delete_domain_settings(&ctx, "domain-1")
+            .await
+            .unwrap();
+    }
+
+    fn state_with_domains(
+        known: &'static [&'static str],
+    ) -> impl std::future::Future<Output = crate::keystone::ServiceState> {
+        let mut resource = crate::resource::MockResourceProvider::default();
+        resource.expect_get_domain().returning(move |_, id| {
+            Ok(known.contains(&id).then(|| {
+                openstack_keystone_core_types::resource::DomainBuilder::default()
+                    .id(id)
+                    .name(id)
+                    .enabled(true)
+                    .build()
+                    .unwrap()
+            }))
+        });
+        get_mocked_state(
+            None,
+            Some(crate::provider::Provider::mocked_builder().mock_resource(resource)),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_update_domain_settings_rejects_unknown_domain() {
+        // No backend expectation: the backend must not be reached.
+        let service = service_with(MockOauth2ClientBackend::new());
+        let state = state_with_domains(&[]).await;
+        let ctx = ExecutionContext::internal(&state);
+
+        let err = service
+            .update_domain_settings(&ctx, "nope", OAuth2DomainSettingsUpdate::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Oauth2ClientProviderError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn test_update_unrelated_field_ignores_trust_domain_drift() {
+        let mut mock = MockOauth2ClientBackend::new();
+        mock.expect_get()
+            .returning(|_, _, _| Ok(Some(sample_resource_from(sample_service_create()))));
+        mock.expect_update()
+            .returning(|_, _, _, _| Ok(sample_resource_from(sample_service_create())));
+        let mut service = service_with(mock);
+        // The deployment's trust domains changed since registration.
+        service.internal_trust_domains = vec!["new.example".into()];
+        let state = get_mocked_state(None, None).await;
+        let ctx = ExecutionContext::internal(&state);
+
+        let update = OAuth2ClientResourceUpdate {
+            description: Some("renamed".into()),
+            ..Default::default()
+        };
+        assert!(
+            service
+                .update(&ctx, "domain-1", "provider-1", update)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_validates_effective_delegation() {
+        let mut mock = MockOauth2ClientBackend::new();
+        mock.expect_get().returning(|_, _, _| {
+            Ok(Some(sample_resource_from(OAuth2ClientResourceCreate {
+                spiffe_ids: vec![],
+                delegation: None,
+                ..sample_create()
+            })))
+        });
+        let service = service_with(mock);
+        let state = get_mocked_state(None, None).await;
+        let ctx = ExecutionContext::internal(&state);
+
+        // A client_secret_basic client cannot become a delegatable service.
+        let update = OAuth2ClientResourceUpdate {
+            delegation: Some(DelegationPolicy {
+                service_grants: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(matches!(
+            service.update(&ctx, "domain-1", "provider-1", update).await,
+            Err(Oauth2ClientProviderError::Validation(_))
+        ));
+
+        // Setting and removing in one patch is rejected.
+        let update = OAuth2ClientResourceUpdate {
+            delegation: Some(DelegationPolicy::default()),
+            remove_delegation: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            service.update(&ctx, "domain-1", "provider-1", update).await,
+            Err(Oauth2ClientProviderError::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn test_with_update_sets_and_removes_delegation() {
+        let current = sample_resource_from(sample_service_create());
+        let removed = current.clone().with_update(
+            OAuth2ClientResourceUpdate {
+                remove_delegation: true,
+                ..Default::default()
+            },
+            1,
+        );
+        assert!(removed.delegation.is_none());
+        assert_eq!(removed.spiffe_ids, current.spiffe_ids);
+        let kept = current
+            .clone()
+            .with_update(OAuth2ClientResourceUpdate::default(), 1);
+        assert_eq!(kept.delegation, current.delegation);
     }
 
     #[tokio::test]
@@ -1109,6 +1907,9 @@ mod tests {
             backchannel_logout_session_required: data.backchannel_logout_session_required,
             frontchannel_logout_uri: data.frontchannel_logout_uri,
             frontchannel_logout_session_required: data.frontchannel_logout_session_required,
+            spiffe_ids: data.spiffe_ids,
+            delegation: data.delegation,
+            dpop_bound_access_tokens: false,
         }
     }
 

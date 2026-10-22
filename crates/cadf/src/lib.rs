@@ -204,7 +204,10 @@
 //! Events built with [`CadfEventPayload::with_oauth2_context`] carry an
 //! additional `oauth2` attachment (`{"client_id", "grant_type"}`) after the
 //! `integrity` one; it is signed like the rest of the record, so readers
-//! must find attachments by `name`, not by position.
+//! must find attachments by `name`, not by position. Events built with
+//! [`CadfEventPayload::with_service_grant`] likewise carry a
+//! `service_grant` attachment (`grant_id`, `grantor_user_id`,
+//! `actor_client_id`, `actor_spiffe_id`, `delegated_project_id`).
 //!
 //! ### Choosing a channel
 //!
@@ -251,6 +254,7 @@
 #![deny(clippy::unwrap_used)]
 
 pub mod config;
+pub mod crypto;
 pub mod dispatcher;
 mod hex;
 pub mod identity;
@@ -267,6 +271,7 @@ pub mod syslog;
 pub mod types;
 
 pub use config::{AuditConfig, AuditSinkConfig, UNKNOWN_NODE_ID};
+pub use crypto::{CryptoError, FIPS_BUILD, assert_fips};
 pub use dispatcher::{
     AuditChannelDead, AuditChannelReceivers, AuditDispatcher, DEFAULT_CRITICAL_CHANNEL_CAPACITY,
     DEFAULT_PERIMETER_CHANNEL_CAPACITY,
@@ -281,5 +286,6 @@ pub use spool::{HmacKeyStore, SpoolConfig, SpoolError};
 #[cfg(feature = "syslog")]
 pub use syslog::{SyslogSink, SyslogSinkConfig};
 pub use types::{
-    CadfEvent, CadfEventPayload, Host, Initiator, Observer, Outcome, OutcomeReason, Target,
+    CadfEvent, CadfEventPayload, Host, Initiator, Observer, Outcome, OutcomeReason,
+    ServiceGrantAudit, Target,
 };

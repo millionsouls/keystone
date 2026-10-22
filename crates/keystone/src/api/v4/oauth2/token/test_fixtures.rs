@@ -56,6 +56,8 @@ pub(in crate::api::v4::oauth2) async fn confidential_client() -> provider_types:
         backchannel_logout_session_required: false,
         frontchannel_logout_uri: None,
         frontchannel_logout_session_required: false,
+        spiffe_ids: vec![],
+        delegation: None,
         client_id: "client-1".into(),
         provider_id: "provider-1".into(),
         domain_id: "domain-1".into(),
@@ -77,6 +79,7 @@ pub(in crate::api::v4::oauth2) async fn confidential_client() -> provider_types:
         policy_uri: None,
         tos_uri: None,
         contacts: vec![],
+        dpop_bound_access_tokens: false,
     }
 }
 
@@ -230,6 +233,8 @@ pub(in crate::api::v4::oauth2) async fn public_authz_code_client()
         backchannel_logout_session_required: false,
         frontchannel_logout_uri: None,
         frontchannel_logout_session_required: false,
+        spiffe_ids: vec![],
+        delegation: None,
         client_id: "client-1".into(),
         provider_id: "provider-1".into(),
         domain_id: "domain-1".into(),
@@ -251,6 +256,7 @@ pub(in crate::api::v4::oauth2) async fn public_authz_code_client()
         policy_uri: None,
         tos_uri: None,
         contacts: vec![],
+        dpop_bound_access_tokens: false,
     }
 }
 

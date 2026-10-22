@@ -25,7 +25,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use minijinja::value::{Kwargs, Value};
+use minijinja::value::{Kwargs, Serde, Value};
 use minijinja::{Environment, context};
 use serde::Serialize;
 use thiserror::Error;
@@ -474,10 +474,10 @@ impl JinjaRenderer {
             Ok::<_, minijinja::Error>(text)
         });
         self.env.get_template(name)?.render(context! {
-            branding => &self.branding,
+            branding => Serde(&self.branding),
             locale => locale,
             t => t,
-            ..Value::from_serialize(ctx)
+            ..Value::from(Serde(ctx))
         })
     }
 }
@@ -711,6 +711,8 @@ mod tests {
             backchannel_logout_session_required: false,
             frontchannel_logout_uri: None,
             frontchannel_logout_session_required: false,
+            spiffe_ids: vec![],
+            delegation: None,
             client_id: "cid".into(),
             provider_id: "prov".into(),
             domain_id: "d".into(),
@@ -732,6 +734,7 @@ mod tests {
             policy_uri: Some("http://insecure.example.com/p".into()),
             tos_uri: None,
             contacts: vec![],
+            dpop_bound_access_tokens: false,
         };
         // Pre-existing records without a name show the provider id.
         let view = ClientView::from_resource(&client);

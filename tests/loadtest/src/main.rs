@@ -18,6 +18,7 @@ use openstack_sdk::{
     AsyncOpenStack,
     config::{CloudConfig, ConfigFile},
 };
+use secrecy::ExposeSecret;
 use std::env;
 use std::time::Duration;
 
@@ -50,12 +51,10 @@ use crate::v3::user::{
     show_random as user_show_random,
 };
 use crate::v4::api_key::{
-    create as api_key_create, list as api_key_list, revoke as api_key_revoke,
-    show as api_key_show,
+    create as api_key_create, list as api_key_list, revoke as api_key_revoke, show as api_key_show,
 };
 use crate::v4::mapping::{
-    create as mapping_create, delete as mapping_delete, list as mapping_list,
-    show as mapping_show,
+    create as mapping_create, delete as mapping_delete, list as mapping_list, show as mapping_show,
 };
 use crate::v4::oauth2::{
     create_cc_client as oauth2_cc_client_create, create_client as oauth2_client_create,
@@ -389,7 +388,7 @@ pub async fn openstack_login(user: &mut GooseUser) -> TransactionResult {
         .expect("cannot connect to the cloud");
     let token = session.get_auth_token().expect("no auth token in session");
     user.set_session_data(Session {
-        token,
+        token: token.expose_secret().to_string(),
         user_id: None,
         project_id: None,
         role_id: None,
@@ -417,5 +416,9 @@ async fn get_admin_token() -> String {
     let session = AsyncOpenStack::new(&profile)
         .await
         .expect("cannot authenticate");
-    session.get_auth_token().expect("no auth token")
+    session
+        .get_auth_token()
+        .expect("no auth token")
+        .expose_secret()
+        .to_string()
 }

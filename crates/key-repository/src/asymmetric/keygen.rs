@@ -11,6 +11,7 @@
 // limitations under the License.
 //
 // SPDX-License-Identifier: Apache-2.0
+// Crypto inventory: TOK-2; see doc/src/contributor/crypto-inventory.md
 //! # Asymmetric keypair generation (ADR 0026 §3)
 use chrono::Utc;
 use p256::ecdsa::SigningKey as EcdsaSigningKey;
@@ -66,7 +67,7 @@ pub fn generate_keypair(algorithm: SigningAlgorithm) -> Result<KeyMaterial, KeyR
     Ok(KeyMaterial {
         algorithm,
         private_key_der: SecretBox::new(Box::new(private_key_der)),
-        public_key_der,
+        public_key_der: public_key_der.to_vec(),
         kid,
         created_at: Utc::now(),
         demoted_at: None,

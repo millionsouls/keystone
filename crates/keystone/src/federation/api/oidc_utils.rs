@@ -11,6 +11,7 @@
 // limitations under the License.
 //
 // SPDX-License-Identifier: Apache-2.0
+// Crypto inventory: TOK-4, TOK-9; see doc/src/contributor/crypto-inventory.md
 
 //! OIDC utilities replacing the openidconnect crate.
 //!
@@ -335,6 +336,7 @@ fn check_nonce(
 /// Build a `reqwest::Client` with redirect following disabled (SSRF guard)
 /// and a reasonable default timeout to prevent resource exhaustion.
 pub(super) fn build_http_client() -> Result<reqwest::Client, OidcError> {
+    openstack_keystone_tls_provider::install_default();
     reqwest::ClientBuilder::new()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(10))
@@ -423,6 +425,12 @@ mod tests {
     use super::*;
     use chrono::{TimeDelta, Utc};
     use httpmock::prelude::*;
+
+    /// Plain client; reqwest needs a process-wide rustls provider first.
+    fn test_client() -> reqwest::Client {
+        openstack_keystone_tls_provider::install_default();
+        reqwest::Client::new()
+    }
     use jsonwebtoken::{EncodingKey, Header as JwtHeader, encode, jwk::JwkSet};
     use serde_json::json;
 
@@ -599,7 +607,7 @@ mod tests {
             }));
         });
 
-        let client = reqwest::Client::new();
+        let client = test_client();
         let metadata = discover(&base_url, &client).await.unwrap();
         assert_eq!(metadata.issuer, base_url);
         assert!(metadata.authorization_endpoint.ends_with("/auth"));
@@ -619,7 +627,7 @@ mod tests {
             }));
         });
 
-        let client = reqwest::Client::new();
+        let client = test_client();
         let url_with_slash = format!("{base_url}/");
         // Should succeed even though trailing slash was appended by caller.
         discover(&url_with_slash, &client).await.unwrap();
@@ -633,7 +641,7 @@ mod tests {
             then.status(404);
         });
 
-        let client = reqwest::Client::new();
+        let client = test_client();
         let result = discover(&server.base_url(), &client).await;
         assert!(result.is_err());
     }
@@ -652,7 +660,7 @@ mod tests {
             }));
         });
 
-        let client = reqwest::Client::new();
+        let client = test_client();
         let result = discover(&server.base_url(), &client).await;
         assert!(
             matches!(result, Err(OidcError::IssuerMismatch { .. })),
@@ -675,7 +683,7 @@ mod tests {
             then.status(200).json_body(json!({"keys": [jwk_val]}));
         });
 
-        let client = reqwest::Client::new();
+        let client = test_client();
         let jwks = fetch_jwks(&format!("{}/jwks.json", server.base_url()), &client)
             .await
             .unwrap();
@@ -690,7 +698,7 @@ mod tests {
             then.status(500);
         });
 
-        let client = reqwest::Client::new();
+        let client = test_client();
         let result = fetch_jwks(&format!("{}/jwks.json", server.base_url()), &client).await;
         assert!(result.is_err());
     }
@@ -711,7 +719,7 @@ mod tests {
             }));
         });
 
-        let client = reqwest::Client::new();
+        let client = test_client();
         let resp = exchange_code(
             &format!("{}/token", server.base_url()),
             "client-id",
@@ -768,7 +776,7 @@ mod tests {
             }));
         });
 
-        let client = reqwest::Client::new();
+        let client = test_client();
         exchange_code(
             &format!("{}/token", server.base_url()),
             "cid",
@@ -790,7 +798,7 @@ mod tests {
             then.status(400);
         });
 
-        let client = reqwest::Client::new();
+        let client = test_client();
         let result = exchange_code(
             &format!("{}/token", server.base_url()),
             "cid",
@@ -1246,7 +1254,7 @@ mod tests {
             }));
         });
 
-        let client = reqwest::Client::new();
+        let client = test_client();
         let resp = exchange_code(
             &format!("{}/token", server.base_url()),
             "cid",

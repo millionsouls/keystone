@@ -11,6 +11,7 @@
 // limitations under the License.
 //
 // SPDX-License-Identifier: Apache-2.0
+// Crypto inventory: AUD-4; see doc/src/contributor/crypto-inventory.md
 
 //! RFC 5424 syslog sink over TCP, optionally wrapped in TLS (#1375).
 //!
@@ -260,7 +261,7 @@ fn client_config(cfg: &SyslogSinkConfig) -> Result<Arc<rustls::ClientConfig>, Si
         }
     }
     let config = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::aws_lc_rs::default_provider(),
+        openstack_keystone_tls_provider::provider(),
     ))
     .with_safe_default_protocol_versions()
     .map_err(|e| SinkError::Delivery(format!("TLS configuration failed: {e}")))?
@@ -493,7 +494,7 @@ mod tests {
 
     #[tokio::test]
     async fn delivers_over_tls_with_custom_ca() {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        openstack_keystone_tls_provider::install_default();
         let rcgen::CertifiedKey { cert, signing_key } =
             rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -536,7 +537,7 @@ mod tests {
     /// name resolves to an IP and must match the certificate's IP SAN.
     #[tokio::test]
     async fn delivers_over_tls_to_an_ip_literal_endpoint() {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        openstack_keystone_tls_provider::install_default();
         let key_pair = rcgen::KeyPair::generate().unwrap();
         let mut params = rcgen::CertificateParams::new(vec!["siem".to_string()]).unwrap();
         params
@@ -589,7 +590,7 @@ mod tests {
                 return;
             }
         };
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        openstack_keystone_tls_provider::install_default();
         let key_pair = rcgen::KeyPair::generate().unwrap();
         let mut params = rcgen::CertificateParams::new(vec!["siem".to_string()]).unwrap();
         params
@@ -635,7 +636,7 @@ mod tests {
 
     #[tokio::test]
     async fn tls_rejects_untrusted_server() {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        openstack_keystone_tls_provider::install_default();
         let trusted = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let rogue = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let dir = tempfile::tempdir().unwrap();

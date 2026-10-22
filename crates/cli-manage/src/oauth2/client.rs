@@ -244,6 +244,9 @@ impl PerformAction for CreateCommand {
                 backchannel_logout_session_required: false,
                 frontchannel_logout_uri: None,
                 frontchannel_logout_session_required: false,
+                spiffe_ids: Vec::new(),
+                delegation: None,
+                dpop_bound_access_tokens: false,
             },
         };
         let body = call(

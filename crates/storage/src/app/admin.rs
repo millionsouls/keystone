@@ -113,6 +113,7 @@ impl Storage {
     /// Forward a `get_by_key` read to the leader via gRPC.
     /// Leader decrypts and returns plaintext; follower wraps it in
     /// StoreDataEnvelope.
+    #[tracing::instrument(name = "storage.forwarded_get_by_key", level = "debug", skip_all)]
     pub(super) async fn forwarded_get_by_key(
         &self,
         leader_id: u64,
@@ -127,11 +128,10 @@ impl Storage {
             key: key.to_vec(),
             keyspace: keyspace.map(String::from),
         };
-        let resp = client.forwarded_get(msg).await.map_err(|status| {
-            ApiStoreError::Other(Box::new(StoreError::Other(eyre::eyre!(
-                "forwarded get failed: {status}"
-            ))))
-        })?;
+        let resp = client
+            .forwarded_get(msg)
+            .await
+            .map_err(|status| forwarded_status_error("forwarded get failed", status))?;
         let inner = resp.into_inner();
 
         if inner.not_found {
@@ -155,6 +155,7 @@ impl Storage {
     }
 
     /// Forward a `prefix_index` scan to the leader via gRPC.
+    #[tracing::instrument(name = "storage.forwarded_prefix_index", level = "debug", skip_all)]
     pub(super) async fn forwarded_prefix_index(
         &self,
         leader_id: u64,
@@ -167,11 +168,10 @@ impl Storage {
         let msg = pb::api::ForwardedPrefixIndexRequest {
             prefix: prefix.to_vec(),
         };
-        let resp = client.forwarded_prefix_index(msg).await.map_err(|status| {
-            ApiStoreError::Other(Box::new(StoreError::Other(eyre::eyre!(
-                "forwarded prefix_index failed: {status}"
-            ))))
-        })?;
+        let resp = client
+            .forwarded_prefix_index(msg)
+            .await
+            .map_err(|status| forwarded_status_error("forwarded prefix_index failed", status))?;
 
         Ok(resp.into_inner().keys)
     }
@@ -192,11 +192,10 @@ impl Storage {
             prefix: prefix.to_vec(),
             keyspace: keyspace.map(String::from),
         };
-        let resp = client.forwarded_prefix(msg).await.map_err(|status| {
-            ApiStoreError::Other(Box::new(StoreError::Other(eyre::eyre!(
-                "forwarded prefix failed: {status}"
-            ))))
-        })?;
+        let resp = client
+            .forwarded_prefix(msg)
+            .await
+            .map_err(|status| forwarded_status_error("forwarded prefix failed", status))?;
         let inner = resp.into_inner();
 
         let mut result = Vec::new();
@@ -235,15 +234,17 @@ impl Storage {
     ///
     /// # Returns
     /// A `Result` containing the `Channel`, or a `StoreError`.
+    #[tracing::instrument(name = "storage.get_or_create_channel", level = "debug", skip_all)]
     async fn get_or_create_channel(
         &self,
         target: u64,
         addr: String,
     ) -> Result<Channel, StoreError> {
-        self.forward_channels
-            .channel(&addr)
-            .await
-            .map_err(|e| StoreError::Other(eyre::eyre!("connect to node {target}: {e}")))
+        self.forward_channels.channel(&addr).await.map_err(|e| {
+            StoreError::Unavailable(StorageUnavailable::new(format!(
+                "connect to node {target}: {e}"
+            )))
+        })
     }
 
     /// Best-effort push of one local-origin emergency candidate to every
@@ -537,5 +538,19 @@ impl Storage {
             }
             Err(other) => Err(other)?,
         }
+    }
+}
+
+/// Map a failed forwarded-read RPC to a store error.
+///
+/// Transport-level failures (leader gone, connection reset, timeout) are
+/// `Unavailable` so the caller re-resolves the leader and retries; anything
+/// else is a hard failure.
+fn forwarded_status_error(what: &str, status: tonic::Status) -> ApiStoreError {
+    match status.code() {
+        Code::Unavailable | Code::DeadlineExceeded | Code::Cancelled | Code::Unknown => {
+            ApiStoreError::Unavailable(StorageUnavailable::new(format!("{what}: {status}")))
+        }
+        _ => ApiStoreError::Other(Box::new(StoreError::Other(eyre::eyre!("{what}: {status}")))),
     }
 }

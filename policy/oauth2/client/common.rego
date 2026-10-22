@@ -26,3 +26,34 @@ foreign_client if {
 	client_domain_id != null
 	client_domain_id != input.credentials.domain_id
 }
+
+# The object (a create payload, an update patch or a stored client) touches
+# the delegatable service registration (ADR 0036 §3): SPIFFE ID patterns or
+# a delegation policy. Registering a delegatable service is admin-only.
+delegation_fields(obj) if {
+	obj.delegation != null
+}
+
+delegation_fields(obj) if {
+	count(obj.spiffe_ids) > 0
+}
+
+delegation_fields(obj) if {
+	obj.remove_delegation == true
+}
+
+# The update patch turns `dpop_bound_access_tokens` off on a client that has
+# it on (ADR 0043 §1). Raising the requirement is self-service, lowering it
+# is admin-only so that a compromised domain manager cannot disable DPoP.
+# Revoking a DPoP-bound client is admin-only for the same reason (see
+# `dpop_bound`); a new client is always created by an explicit request, so
+# the create policy cannot tell a downgrade from a fresh registration.
+dpop_lowered if {
+	input.target.oauth2_client.dpop_bound_access_tokens == false
+	input.existing.oauth2_client.dpop_bound_access_tokens == true
+}
+
+# The stored client requires DPoP-bound access tokens.
+dpop_bound if {
+	input.existing.oauth2_client.dpop_bound_access_tokens == true
+}

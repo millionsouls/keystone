@@ -145,9 +145,9 @@ fn provision_token(module: &PathBuf) {
 
 /// Config for a single, unnetworked node backed by the real SoftHSM2 token
 /// at `module`. No gRPC server is started — as in `test_cluster`'s
-/// `quarantine::test_quarantine_committed_via_raft`, the Raft handle is exercised
-/// directly, which is enough to drive the state machine's DEK wrap/unwrap
-/// path without needing a live network listener.
+/// `quarantine::test_quarantine_committed_via_raft`, the Raft handle is
+/// exercised directly, which is enough to drive the state machine's DEK
+/// wrap/unwrap path without needing a live network listener.
 fn pkcs11_ds_config(
     node_id: u64,
     db_path: PathBuf,
@@ -220,7 +220,7 @@ fn test_pkcs11_backed_cluster_write_read() {
     if skip_without_softhsm() {
         return;
     }
-    let provider = rustls::crypto::aws_lc_rs::default_provider();
+    let provider = openstack_keystone_tls_provider::provider();
     let _ = rustls::crypto::CryptoProvider::install_default(provider);
 
     with_provisioned_token(|module| {
@@ -295,7 +295,7 @@ fn test_pkcs11_backed_cluster_restart_reopens_token() {
     if skip_without_softhsm() {
         return;
     }
-    let provider = rustls::crypto::aws_lc_rs::default_provider();
+    let provider = openstack_keystone_tls_provider::provider();
     let _ = rustls::crypto::CryptoProvider::install_default(provider);
 
     with_provisioned_token(|module| {

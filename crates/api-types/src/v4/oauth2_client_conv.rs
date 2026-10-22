@@ -72,6 +72,9 @@ impl From<api::OAuth2ClientCreateRequest> for core::OAuth2ClientResourceCreate {
             backchannel_logout_session_required: c.backchannel_logout_session_required,
             frontchannel_logout_uri: c.frontchannel_logout_uri,
             frontchannel_logout_session_required: c.frontchannel_logout_session_required,
+            spiffe_ids: c.spiffe_ids,
+            delegation: c.delegation.map(Into::into),
+            dpop_bound_access_tokens: c.dpop_bound_access_tokens,
         }
     }
 }
@@ -105,6 +108,10 @@ impl From<api::OAuth2ClientUpdate> for core::OAuth2ClientResourceUpdate {
             backchannel_logout_session_required: value.backchannel_logout_session_required,
             frontchannel_logout_uri: value.frontchannel_logout_uri,
             frontchannel_logout_session_required: value.frontchannel_logout_session_required,
+            spiffe_ids: value.spiffe_ids,
+            delegation: value.delegation.map(Into::into),
+            remove_delegation: value.remove_delegation,
+            dpop_bound_access_tokens: value.dpop_bound_access_tokens,
         }
     }
 }
@@ -139,6 +146,37 @@ impl From<core::OAuth2ClientResource> for api::OAuth2Client {
             backchannel_logout_session_required: value.backchannel_logout_session_required,
             frontchannel_logout_uri: value.frontchannel_logout_uri,
             frontchannel_logout_session_required: value.frontchannel_logout_session_required,
+            spiffe_ids: value.spiffe_ids,
+            delegation: value.delegation.map(Into::into),
+            dpop_bound_access_tokens: value.dpop_bound_access_tokens,
+        }
+    }
+}
+
+impl From<api::DelegationPolicy> for core::DelegationPolicy {
+    fn from(value: api::DelegationPolicy) -> Self {
+        Self {
+            service_grants: value.service_grants,
+            on_behalf_of: value.on_behalf_of,
+            cross_domain: value.cross_domain,
+            max_role_ids: value.max_role_ids,
+            max_grant_lifetime: value.max_grant_lifetime,
+            max_operation_lifetime: value.max_operation_lifetime,
+            max_grants_per_project: value.max_grants_per_project,
+        }
+    }
+}
+
+impl From<core::DelegationPolicy> for api::DelegationPolicy {
+    fn from(value: core::DelegationPolicy) -> Self {
+        Self {
+            service_grants: value.service_grants,
+            on_behalf_of: value.on_behalf_of,
+            cross_domain: value.cross_domain,
+            max_role_ids: value.max_role_ids,
+            max_grant_lifetime: value.max_grant_lifetime,
+            max_operation_lifetime: value.max_operation_lifetime,
+            max_grants_per_project: value.max_grants_per_project,
         }
     }
 }

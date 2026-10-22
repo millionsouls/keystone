@@ -794,7 +794,8 @@ pub(super) async fn authorize_login(
         {
             Ok(f) => f,
             Err(e) => {
-                // Fail closed: never skip a second factor because the lookup failed.
+                // Fail closed: never skip a second factor because the lookup
+                // failed.
                 tracing::warn!(error = %e, "oauth2 second-factor lookup failed");
                 return Ok(error_page(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -1091,6 +1092,7 @@ async fn finish_consent(
                 },
                 upstream: session.upstream.clone(),
                 sso_id: sso_id.map(str::to_string),
+                dpop_jkt: None,
             },
         )
         .await
@@ -1148,6 +1150,8 @@ mod tests {
             backchannel_logout_session_required: false,
             frontchannel_logout_uri: None,
             frontchannel_logout_session_required: false,
+            spiffe_ids: vec![],
+            delegation: None,
             client_id: "client-1".into(),
             provider_id: "provider-1".into(),
             domain_id: "domain-1".into(),
@@ -1169,6 +1173,7 @@ mod tests {
             policy_uri: None,
             tos_uri: None,
             contacts: vec![],
+            dpop_bound_access_tokens: false,
         }
     }
 
@@ -2242,7 +2247,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_mfa_without_pending_factor_or_with_bad_csrf_is_bad_request() {
-        // No pending second factor: a password-only session cannot use the step.
+        // No pending second factor: a password-only session cannot use the
+        // step.
         let session = sample_session();
         let csrf = csrf_for(&session);
         let mut session_mock = MockOauth2SessionProvider::default();

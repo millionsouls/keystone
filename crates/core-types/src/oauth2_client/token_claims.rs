@@ -11,6 +11,7 @@
 // limitations under the License.
 //
 // SPDX-License-Identifier: Apache-2.0
+// Crypto inventory: TOK-11; see doc/src/contributor/crypto-inventory.md
 //! # OAuth2 outbound access token claims (ADR 0026 §4)
 //!
 //! [`OpenStackAccessTokenClaims`] is the authorization claim set consumed by
@@ -25,6 +26,7 @@ use std::collections::HashMap;
 
 use crate::role::RoleRef;
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 
 /// Identity claims delivered to the relying party (OIDC Core §2), issued as
 /// the `id_token` on the `authorization_code` grant (ADR 0026 §4).
@@ -73,6 +75,22 @@ pub struct IdTokenClaims {
     pub extra_claims: HashMap<String, serde_json::Value>,
 }
 
+/// `cnf` (confirmation) claim of a sender-constrained access token (RFC 7800,
+/// RFC 9449 §6, ADR 0043 §3).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Confirmation {
+    /// RFC 7638 SHA-256 thumbprint of the DPoP proof key.
+    pub jkt: String,
+}
+
+impl Confirmation {
+    /// Whether the confirmation binds to the given proof key thumbprint
+    /// (constant time). An empty `jkt` never matches.
+    pub fn matches(&self, jkt: &str) -> bool {
+        !self.jkt.is_empty() && bool::from(self.jkt.as_bytes().ct_eq(jkt.as_bytes()))
+    }
+}
+
 /// Minimal `access_token` issued on `authorization_code`/`refresh_token`
 /// grants that did NOT request (or were not granted) the `openstack:api`
 /// scope (ADR 0026 §4, "Scope Validation"). Carries no OpenStack
@@ -113,6 +131,9 @@ pub struct OidcAccessTokenClaims {
     /// (older tokens carry it as `sid`, which verification still accepts).
     #[serde(default, rename = "fid", skip_serializing_if = "Option::is_none")]
     pub family_id: Option<String>,
+    /// DPoP binding of the token (ADR 0043 §3). Absent for bearer tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cnf: Option<Confirmation>,
 }
 
 /// Audience of an OpenStack access token: the whole control plane of the
@@ -234,6 +255,15 @@ pub struct OpenStackAccessTokenClaims {
     /// 0026 §12) will populate.
     pub delegation_context: DelegationContext,
 
+    /// RFC 8693 `act`: the service acting for `sub`, on tokens a service
+    /// obtained by redeeming a delegation (ADR 0036 §5.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub act: Option<ActClaim>,
+
+    /// DPoP binding of the token (ADR 0043 §3). Absent for bearer tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cnf: Option<Confirmation>,
+
     #[serde(flatten)]
     pub openstack_context: OpenStackContext,
 }
@@ -261,6 +291,37 @@ pub enum DelegationContext {
         #[serde(rename = "delegated_project_id")]
         project_id: String,
     },
+    /// A service acting for a user under a service grant (ADR 0036 §5.2).
+    ServiceGrant {
+        #[serde(rename = "delegated_project_id")]
+        project_id: String,
+        /// The redeemed grant.
+        grant_id: String,
+    },
+}
+
+/// Namespace of [`ActClaim::sub`] (ADR 0036 §5.2). Consumers branch on it
+/// rather than on the shape of `sub`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ActSubType {
+    /// A SPIFFE ID: the service client's SVID.
+    Spiffe,
+    /// A Keystone user id (human grantee, ADR 0036 §9).
+    UserId,
+}
+
+/// RFC 8693 §4.1 `act` claim: who acts for the token subject (ADR 0036
+/// §5.2). Always present on a delegated service token; there is no way to
+/// mint one that hides the acting service.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActClaim {
+    /// The acting service's client id.
+    pub client_id: String,
+    /// Namespace of `sub`.
+    pub sub_type: ActSubType,
+    /// The actor's identity in that namespace.
+    pub sub: String,
 }
 
 /// OpenStack identity/authorization context embedded in an
@@ -336,6 +397,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_confirmation_matches_constant_time_semantics() {
+        let cnf = Confirmation { jkt: "abc".into() };
+        assert!(cnf.matches("abc"));
+        assert!(!cnf.matches("and"));
+        assert!(!cnf.matches("ab"));
+        assert!(!cnf.matches(""));
+        assert!(!Confirmation { jkt: String::new() }.matches(""));
+    }
+
+    #[test]
+    fn test_oidc_claims_cnf_is_omitted_when_unbound_and_roundtrips() {
+        let mut claims: OidcAccessTokenClaims = serde_json::from_value(serde_json::json!({
+            "iss": "i", "sub": "s", "aud": "a", "exp": 2, "iat": 1, "nbf": 1,
+            "jti": "j", "scope": "openid", "token_use": "access"
+        }))
+        .unwrap();
+        assert!(claims.cnf.is_none());
+        assert!(serde_json::to_value(&claims).unwrap().get("cnf").is_none());
+
+        claims.cnf = Some(Confirmation {
+            jkt: "thumb".into(),
+        });
+        let value = serde_json::to_value(&claims).unwrap();
+        assert_eq!(value["cnf"], serde_json::json!({"jkt": "thumb"}));
+        let back: OidcAccessTokenClaims = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            back.cnf,
+            Some(Confirmation {
+                jkt: "thumb".into()
+            })
+        );
+    }
+
+    #[test]
     fn test_plain_delegation_context_serializes_without_project_id() {
         let value = serde_json::to_value(DelegationContext::Plain).unwrap();
         assert_eq!(value, serde_json::json!({"auth_method": "plain"}));
@@ -368,6 +463,7 @@ mod tests {
             amr: vec!["client_credentials".to_string()],
             token_use: "access".to_string(),
             delegation_context: DelegationContext::Plain,
+            act: None,
             openstack_context: OpenStackContext {
                 user_id: "shadow-user".to_string(),
                 user_name: "client-1".to_string(),
@@ -378,6 +474,7 @@ mod tests {
                 },
                 roles: vec!["member".to_string()],
             },
+            cnf: None,
         };
         let value = serde_json::to_value(&claims).unwrap();
         assert_eq!(value["scope_type"], "domain");
@@ -462,6 +559,7 @@ mod tests {
             scope: "openid profile".to_string(),
             token_use: "access".to_string(),
             family_id: None,
+            cnf: None,
         };
         let value = serde_json::to_value(&claims).unwrap();
         assert_eq!(value["aud"], "client-1");

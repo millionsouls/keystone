@@ -18,11 +18,18 @@
 //! health and storage growth, and publishes the result as Prometheus metrics
 //! and a JSON verdict. See `tests/soak/README.md`.
 
+mod canary;
+mod chaos;
 mod invariants;
 mod load;
+mod membership;
+mod operator;
+mod partition;
 mod prom;
 mod report;
+mod rollout;
 mod server;
+mod spire;
 
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -108,6 +115,120 @@ struct Args {
     steady_users: usize,
     #[arg(long, env = "SOAK_BURST_USERS", default_value_t = 100)]
     burst_users: usize,
+    /// Delete one Raft pod this often while the load runs (`0` disables).
+    /// Needs RBAC to delete pods, see `overlays/soak/soak.yaml`.
+    #[arg(long, env = "SOAK_CHAOS_INTERVAL", default_value = "0s", value_parser = humantime::parse_duration)]
+    chaos_interval: Duration,
+    /// A deleted pod must be ready again within this time.
+    #[arg(long, env = "SOAK_CHAOS_RECOVERY", default_value = "5m", value_parser = humantime::parse_duration)]
+    chaos_recovery: Duration,
+    /// Label selector of the Raft pods chaos may delete.
+    #[arg(
+        long,
+        env = "SOAK_CHAOS_SELECTOR",
+        default_value = "app.kubernetes.io/name=keystone-rs"
+    )]
+    chaos_selector: String,
+    /// Raft pod that chaos never kills and the membership task never wipes.
+    /// It keeps one uninterrupted disk series, so storage growth that the
+    /// restarts of the other pods hide still shows up (empty disables).
+    #[arg(long, env = "SOAK_CONTROL_POD", default_value = "")]
+    control_pod: String,
+    /// Stop starting faults (kills, partitions, rollouts, agent restarts,
+    /// membership changes) this long before the end of the run, so every
+    /// node's storage can be judged without restarts (`0` disables). Should
+    /// exceed `SOAK_GROWTH_WINDOW` by the longest recovery time.
+    #[arg(long, env = "SOAK_QUIET_WINDOW", default_value = "0s", value_parser = humantime::parse_duration)]
+    quiet_window: Duration,
+    /// Cut one Raft node off from its peers this often (`0` disables).
+    /// Needs RBAC for network policies, see `overlays/soak/soak.yaml`, and a
+    /// CNI that enforces them (k3s does).
+    #[arg(long, env = "SOAK_PARTITION_INTERVAL", default_value = "0s", value_parser = humantime::parse_duration)]
+    partition_interval: Duration,
+    /// How long the node stays cut off.
+    #[arg(long, env = "SOAK_PARTITION_DURATION", default_value = "60s", value_parser = humantime::parse_duration)]
+    partition_duration: Duration,
+    /// The other nodes must lead and accept writes within this time.
+    #[arg(long, env = "SOAK_PARTITION_ELECTION", default_value = "60s", value_parser = humantime::parse_duration)]
+    partition_election: Duration,
+    /// The cluster must converge within this time after the cut is lifted.
+    #[arg(long, env = "SOAK_PARTITION_RECOVERY", default_value = "3m", value_parser = humantime::parse_duration)]
+    partition_recovery: Duration,
+    /// Restart the whole StatefulSet, pod after pod, this often (`0`
+    /// disables). Needs RBAC to patch the StatefulSet, see
+    /// `overlays/soak/soak.yaml`.
+    #[arg(long, env = "SOAK_ROLLOUT_INTERVAL", default_value = "0s", value_parser = humantime::parse_duration)]
+    rollout_interval: Duration,
+    /// Name of the StatefulSet to restart.
+    #[arg(long, env = "SOAK_ROLLOUT_STATEFULSET", default_value = "keystone-rs")]
+    rollout_statefulset: String,
+    /// A rolling restart must finish and the cluster converge within this
+    /// time.
+    #[arg(long, env = "SOAK_ROLLOUT_TIMEOUT", default_value = "15m", value_parser = humantime::parse_duration)]
+    rollout_timeout: Duration,
+    /// Longest allowed stretch without an acknowledged write during a
+    /// rolling restart.
+    #[arg(long, env = "SOAK_ROLLOUT_MAX_WRITE_GAP", default_value = "60s", value_parser = humantime::parse_duration)]
+    rollout_max_write_gap: Duration,
+    /// Delete the SPIRE agent pod this often (`0` disables). The agent is
+    /// shared node infrastructure and needs RBAC in its namespace, see
+    /// `overlays/soak/soak.yaml`.
+    #[arg(long, env = "SOAK_SPIRE_INTERVAL", default_value = "0s", value_parser = humantime::parse_duration)]
+    spire_interval: Duration,
+    /// Namespace of the SPIRE agent.
+    #[arg(long, env = "SOAK_SPIRE_NAMESPACE", default_value = "spire")]
+    spire_namespace: String,
+    /// Label selector of the SPIRE agent pods.
+    #[arg(
+        long,
+        env = "SOAK_SPIRE_SELECTOR",
+        default_value = "app.kubernetes.io/name=agent,app.kubernetes.io/instance=spire"
+    )]
+    spire_selector: String,
+    /// The agent must be ready again and the cluster converged within this
+    /// time.
+    #[arg(long, env = "SOAK_SPIRE_RECOVERY", default_value = "5m", value_parser = humantime::parse_duration)]
+    spire_recovery: Duration,
+    /// Longest allowed stretch without an acknowledged write while the agent
+    /// restarts.
+    #[arg(long, env = "SOAK_SPIRE_MAX_WRITE_GAP", default_value = "30s", value_parser = humantime::parse_duration)]
+    spire_max_write_gap: Duration,
+    /// Watch keystone for restarts this long after the agent is back.
+    #[arg(long, env = "SOAK_SPIRE_WATCH", default_value = "60s", value_parser = humantime::parse_duration)]
+    spire_watch: Duration,
+    /// Replace a wiped node and grow and shrink the cluster this often (`0`
+    /// disables). Needs the storage operator Deployment and RBAC to run jobs
+    /// from its template, see `overlays/soak/soak.yaml`.
+    #[arg(long, env = "SOAK_MEMBERSHIP_INTERVAL", default_value = "0s", value_parser = humantime::parse_duration)]
+    membership_interval: Duration,
+    /// Every step of a membership scenario must finish within this time.
+    #[arg(long, env = "SOAK_MEMBERSHIP_TIMEOUT", default_value = "10m", value_parser = humantime::parse_duration)]
+    membership_timeout: Duration,
+    /// Longest allowed stretch without an acknowledged write during a
+    /// membership scenario.
+    #[arg(long, env = "SOAK_MEMBERSHIP_MAX_WRITE_GAP", default_value = "30s", value_parser = humantime::parse_duration)]
+    membership_max_write_gap: Duration,
+    /// Replicas the scale scenario grows the StatefulSet to.
+    #[arg(long, env = "SOAK_MEMBERSHIP_SCALE_TO", default_value_t = 5)]
+    membership_scale_to: usize,
+    /// Name of the storage operator Deployment.
+    #[arg(
+        long,
+        env = "SOAK_OPERATOR_DEPLOYMENT",
+        default_value = "keystone-storage-operator"
+    )]
+    operator_deployment: String,
+    /// Prefix of the volume claims of the StatefulSet.
+    #[arg(long, env = "SOAK_CLAIM_PREFIX", default_value = "raft-storage")]
+    claim_prefix: String,
+    /// Write and verify a canary record this often (`0` disables). Each
+    /// record is read back from every node (read-after-write) and the
+    /// earlier ones are re-checked (integrity).
+    #[arg(long, env = "SOAK_CANARY_INTERVAL", default_value = "0s", value_parser = humantime::parse_duration)]
+    canary_interval: Duration,
+    /// Port of the keystone API on every pod.
+    #[arg(long, env = "SOAK_API_PORT", default_value_t = 8080)]
+    api_port: u16,
     /// Do not generate load, only watch the cluster.
     #[arg(long, env = "SOAK_NO_LOAD", default_value_t = false, action = clap::ArgAction::Set)]
     no_load: bool,
@@ -135,6 +256,14 @@ struct Args {
     /// Allowed relative log growth within the window (0.5 = +50 %).
     #[arg(long, env = "SOAK_MAX_LOG_GROWTH", default_value_t = 0.5)]
     max_log_growth: f64,
+    /// Allowed relative disk growth of one node between the first and last
+    /// quarter of an uninterrupted `SOAK_GROWTH_WINDOW` (0.25 = +25 %).
+    #[arg(long, env = "SOAK_MAX_DISK_GROWTH", default_value_t = 0.25)]
+    max_disk_growth: f64,
+    /// Disk growth below this many bytes is not judged (journal files are
+    /// preallocated in 64 MiB steps).
+    #[arg(long, env = "SOAK_MIN_DISK_GROWTH", default_value_t = 268_435_456.0)]
+    min_disk_growth: f64,
     /// Allowed max/min disk usage ratio between nodes.
     #[arg(long, env = "SOAK_MAX_DISK_SPREAD", default_value_t = 2.0)]
     max_disk_spread: f64,
@@ -150,6 +279,16 @@ struct Args {
     /// negative responses and throttling (429) are not failures.
     #[arg(long, env = "SOAK_MAX_LOAD_ERROR_RATE", default_value_t = 0.01)]
     max_load_error_rate: f64,
+    /// Largest allowed p99 of GET requests per load phase (`0` disables).
+    #[arg(long, env = "SOAK_MAX_READ_P99", default_value = "1s", value_parser = humantime::parse_duration)]
+    max_read_p99: Duration,
+    /// Largest allowed p99 of writes per load phase (`0` disables).
+    #[arg(long, env = "SOAK_MAX_WRITE_P99", default_value = "2s", value_parser = humantime::parse_duration)]
+    max_write_p99: Duration,
+    /// Largest allowed p99 of token issuing per load phase (`0` disables).
+    /// Password hashing makes this the slowest class under burst load.
+    #[arg(long, env = "SOAK_MAX_AUTH_P99", default_value = "2s", value_parser = humantime::parse_duration)]
+    max_auth_p99: Duration,
     /// Load phases with fewer requests are too small to judge.
     #[arg(long, env = "SOAK_MIN_LOAD_REQUESTS", default_value_t = 100)]
     min_load_requests: u64,
@@ -292,6 +431,252 @@ fn check_load(state: &Shared, checked: &mut u64, now: Duration, args: &Args) -> 
     found
 }
 
+/// Invariants a membership scenario violates on purpose while it runs.
+const PLANNED_BY_MEMBERSHIP: &[&str] = &[
+    "scrape",
+    "ready",
+    "voters",
+    "learners",
+    "applied_spread",
+    "apply_lag",
+    "replication_lag",
+];
+
+/// Time windows (seconds since the start) in which the cluster was
+/// deliberately disturbed: from a pod kill, a partition or a rolling restart
+/// until it recovered,
+/// plus a margin for the load to settle.
+fn disturbed_windows(state: &Shared, now: Duration, args: &Args) -> Vec<(u64, u64)> {
+    const MARGIN: u64 = 30;
+    let Ok(g) = state.read() else {
+        return Vec::new();
+    };
+    let now = now.as_secs();
+    let kills = g.chaos.events.iter().map(|e| {
+        let took = e.recovery_secs.unwrap_or(now.saturating_sub(e.at_secs));
+        (e.at_secs, e.at_secs + took + MARGIN)
+    });
+    let hold = args.partition_duration.as_secs();
+    let cuts = g.partition.events.iter().map(|e| {
+        let heal = e.heal_secs.unwrap_or(now.saturating_sub(e.at_secs));
+        (e.at_secs, e.at_secs + hold + heal + MARGIN)
+    });
+    let agents = g.spire.events.iter().map(|e| {
+        let took = e.agent_ready_secs.unwrap_or(now.saturating_sub(e.at_secs));
+        (
+            e.at_secs,
+            e.at_secs + took + MARGIN + args.spire_watch.as_secs(),
+        )
+    });
+    let churn = g.membership.events.iter().map(|e| {
+        let took = e.took_secs.unwrap_or(now.saturating_sub(e.at_secs));
+        (e.at_secs, e.at_secs + took + MARGIN)
+    });
+    let rolls = g.rollout.events.iter().map(|e| {
+        let took = e.converged_secs.unwrap_or(now.saturating_sub(e.at_secs));
+        (e.at_secs, e.at_secs + took + MARGIN)
+    });
+    kills
+        .chain(cuts)
+        .chain(rolls)
+        .chain(agents)
+        .chain(churn)
+        .collect()
+}
+
+/// Judge the p99 latency of load phases that finished since the last call.
+/// Phases that overlap a pod kill, a partition or a rolling restart are not judged: they are
+/// slow on purpose, and the error rate covers them.
+fn check_latency(state: &Shared, checked: &mut u64, now: Duration, args: &Args) -> Vec<Violation> {
+    let windows = disturbed_windows(state, now, args);
+    let Ok(g) = state.read() else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    let already = *checked;
+    for p in g.phases.iter().filter(|p| p.seq > already) {
+        *checked = p.seq;
+        let Some(s) = &p.summary else { continue };
+        let end = p.start_secs + p.length_secs;
+        if windows.iter().any(|(a, b)| *a < end && p.start_secs < *b) {
+            continue;
+        }
+        for (class, limit) in [
+            ("read", args.max_read_p99),
+            ("write", args.max_write_p99),
+            ("auth", args.max_auth_p99),
+        ] {
+            let Some(l) = s.latency_by_class_ms.get(class) else {
+                continue;
+            };
+            if limit.is_zero() || l.requests < args.min_load_requests {
+                continue;
+            }
+            if u128::from(l.p99) > limit.as_millis() {
+                found.push(Violation {
+                    at_secs: now.as_secs(),
+                    check: "latency_p99",
+                    detail: format!(
+                        "{} phase {}: {class} p99 is {} ms over {} requests (limit {})",
+                        p.kind,
+                        p.seq,
+                        l.p99,
+                        l.requests,
+                        humantime::format_duration(limit)
+                    ),
+                });
+            }
+        }
+    }
+    found
+}
+
+/// Judge the recovery of chaos kills that were settled since the last call.
+fn check_chaos(state: &Shared, checked: &mut u64, now: Duration, args: &Args) -> Vec<Violation> {
+    let Ok(g) = state.read() else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    let already = *checked;
+    for e in g.chaos.events.iter().filter(|e| e.seq > already) {
+        // A kill that is still recovering is judged when it settles.
+        if e.recovery_secs.is_none() && !e.timed_out {
+            break;
+        }
+        *checked = e.seq;
+        if e.timed_out {
+            found.push(Violation {
+                at_secs: now.as_secs(),
+                check: "chaos_recovery",
+                detail: format!(
+                    "pod {} (kill {}) was not ready again within {}",
+                    e.pod,
+                    e.seq,
+                    humantime::format_duration(args.chaos_recovery)
+                ),
+            });
+        }
+    }
+    found
+}
+
+/// Report the failed checks of partitions that settled since the last call.
+fn check_partition(state: &Shared, checked: &mut u64, now: Duration) -> Vec<Violation> {
+    let Ok(g) = state.read() else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    let already = *checked;
+    for e in g.partition.events.iter().filter(|e| e.seq > already) {
+        // A partition that is still healing is judged when it settles.
+        if !e.done {
+            break;
+        }
+        *checked = e.seq;
+        for f in &e.failures {
+            found.push(Violation {
+                at_secs: now.as_secs(),
+                check: f.check,
+                detail: format!("partition {} of {} {}: {}", e.seq, e.role, e.pod, f.detail),
+            });
+        }
+    }
+    found
+}
+
+/// Report the failed checks of rolling restarts that settled since the last
+/// call.
+fn check_rollout(state: &Shared, checked: &mut u64, now: Duration) -> Vec<Violation> {
+    let Ok(g) = state.read() else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    let already = *checked;
+    for e in g.rollout.events.iter().filter(|e| e.seq > already) {
+        // A rollout that is still running is judged when it settles.
+        if !e.done {
+            break;
+        }
+        *checked = e.seq;
+        for f in &e.failures {
+            found.push(Violation {
+                at_secs: now.as_secs(),
+                check: f.check,
+                detail: format!("rollout {}: {}", e.seq, f.detail),
+            });
+        }
+    }
+    found
+}
+
+/// Report the failed checks of SPIRE agent restarts that settled since the
+/// last call.
+fn check_spire(state: &Shared, checked: &mut u64, now: Duration) -> Vec<Violation> {
+    let Ok(g) = state.read() else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    let already = *checked;
+    for e in g.spire.events.iter().filter(|e| e.seq > already) {
+        // A restart that is still being watched is judged when it settles.
+        if !e.done {
+            break;
+        }
+        *checked = e.seq;
+        for f in &e.failures {
+            found.push(Violation {
+                at_secs: now.as_secs(),
+                check: f.check,
+                detail: format!("SPIRE agent restart {} ({}): {}", e.seq, e.pod, f.detail),
+            });
+        }
+    }
+    found
+}
+
+/// Report the failed checks of membership scenarios that settled since the
+/// last call.
+fn check_membership(state: &Shared, checked: &mut u64, now: Duration) -> Vec<Violation> {
+    let Ok(g) = state.read() else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    let already = *checked;
+    for e in g.membership.events.iter().filter(|e| e.seq > already) {
+        // A scenario that is still running is judged when it settles.
+        if !e.done {
+            break;
+        }
+        *checked = e.seq;
+        for f in &e.failures {
+            found.push(Violation {
+                at_secs: now.as_secs(),
+                check: f.check,
+                detail: format!("membership {} {}: {}", e.seq, e.kind, f.detail),
+            });
+        }
+    }
+    found
+}
+
+/// Report canary failures recorded since the last call.
+fn check_canary(state: &Shared, checked: &mut u64, now: Duration) -> Vec<Violation> {
+    let Ok(g) = state.read() else {
+        return Vec::new();
+    };
+    let already = *checked;
+    let mut found = Vec::new();
+    for f in g.canary.failures.iter().filter(|f| f.seq > already) {
+        *checked = f.seq;
+        found.push(Violation {
+            at_secs: now.as_secs(),
+            check: f.check,
+            detail: f.detail.clone(),
+        });
+    }
+    found
+}
+
 async fn terminate() {
     #[cfg(unix)]
     {
@@ -321,6 +706,19 @@ async fn main() -> Result<()> {
 
     let start = Instant::now();
     let deadline = (!args.duration.is_zero()).then(|| start + args.duration);
+    if !args.quiet_window.is_zero() && args.duration <= args.quiet_window {
+        bail!("SOAK_QUIET_WINDOW must be shorter than SOAK_DURATION");
+    }
+    if !args.quiet_window.is_zero() && args.quiet_window < args.growth_window {
+        warn!(
+            quiet = ?args.quiet_window,
+            growth = ?args.growth_window,
+            "quiet window is shorter than the growth window, \
+             node disk growth will not be judged"
+        );
+    }
+    // Fault tasks stop starting new faults at this point.
+    let fault_deadline = deadline.map(|d| d.checked_sub(args.quiet_window).unwrap_or(d));
     info!(duration = ?args.duration, interval = ?args.interval, "soak test starting");
     if args.expected_voters < 3 {
         warn!(
@@ -359,6 +757,145 @@ async fn main() -> Result<()> {
         Some(tokio::spawn(load::run(cfg, deadline)))
     };
 
+    if !args.chaos_interval.is_zero() {
+        let cfg = chaos::ChaosConfig {
+            interval: args.chaos_interval,
+            recovery_timeout: args.chaos_recovery,
+            selector: args.chaos_selector.clone(),
+            expected_pods: usize::try_from(args.expected_voters).unwrap_or(usize::MAX),
+            control_pod: args.control_pod.clone(),
+            start,
+            state: state.clone(),
+        };
+        tokio::spawn(async move {
+            if let Err(e) = chaos::run(cfg, deadline, fault_deadline).await {
+                error!(error = %format!("{e:#}"), "chaos task stopped");
+            }
+        });
+    }
+
+    if !args.partition_interval.is_zero() {
+        let cfg = partition::PartitionConfig {
+            interval: args.partition_interval,
+            duration: args.partition_duration,
+            election_timeout: args.partition_election,
+            recovery_timeout: args.partition_recovery,
+            selector: args.chaos_selector.clone(),
+            expected_pods: usize::try_from(args.expected_voters).unwrap_or(usize::MAX),
+            service: args.metrics_service.clone(),
+            metrics_port: args.metrics_port,
+            api_port: args.api_port,
+            host: args.host.clone(),
+            start,
+            state: state.clone(),
+        };
+        tokio::spawn(async move {
+            if let Err(e) = partition::run(cfg, deadline, fault_deadline).await {
+                error!(error = %format!("{e:#}"), "partition task stopped");
+            }
+        });
+    }
+
+    if !args.rollout_interval.is_zero() {
+        let cfg = rollout::RolloutConfig {
+            interval: args.rollout_interval,
+            timeout: args.rollout_timeout,
+            max_write_gap: args.rollout_max_write_gap,
+            statefulset: args.rollout_statefulset.clone(),
+            selector: args.chaos_selector.clone(),
+            expected_pods: usize::try_from(args.expected_voters).unwrap_or(usize::MAX),
+            service: args.metrics_service.clone(),
+            metrics_port: args.metrics_port,
+            write_node: args
+                .host
+                .trim_start_matches("http://")
+                .trim_end_matches('/')
+                .to_string(),
+            host: args.host.clone(),
+            start,
+            state: state.clone(),
+        };
+        tokio::spawn(async move {
+            if let Err(e) = rollout::run(cfg, deadline, fault_deadline).await {
+                error!(error = %format!("{e:#}"), "rollout task stopped");
+            }
+        });
+    }
+
+    if !args.spire_interval.is_zero() {
+        let cfg = spire::SpireConfig {
+            interval: args.spire_interval,
+            namespace: args.spire_namespace.clone(),
+            agent_selector: args.spire_selector.clone(),
+            recovery_timeout: args.spire_recovery,
+            max_write_gap: args.spire_max_write_gap,
+            watch: args.spire_watch,
+            selector: args.chaos_selector.clone(),
+            expected_pods: usize::try_from(args.expected_voters).unwrap_or(usize::MAX),
+            service: args.metrics_service.clone(),
+            metrics_port: args.metrics_port,
+            write_node: args
+                .host
+                .trim_start_matches("http://")
+                .trim_end_matches('/')
+                .to_string(),
+            host: args.host.clone(),
+            start,
+            state: state.clone(),
+        };
+        tokio::spawn(async move {
+            if let Err(e) = spire::run(cfg, deadline, fault_deadline).await {
+                error!(error = %format!("{e:#}"), "spire task stopped");
+            }
+        });
+    }
+
+    if !args.membership_interval.is_zero() {
+        let cfg = membership::MembershipConfig {
+            interval: args.membership_interval,
+            step_timeout: args.membership_timeout,
+            max_write_gap: args.membership_max_write_gap,
+            statefulset: args.rollout_statefulset.clone(),
+            operator_deployment: args.operator_deployment.clone(),
+            claim_prefix: args.claim_prefix.clone(),
+            scale_to: args.membership_scale_to,
+            selector: args.chaos_selector.clone(),
+            control_pod: args.control_pod.clone(),
+            expected_pods: usize::try_from(args.expected_voters).unwrap_or(usize::MAX),
+            service: args.metrics_service.clone(),
+            metrics_port: args.metrics_port,
+            write_node: args
+                .host
+                .trim_start_matches("http://")
+                .trim_end_matches('/')
+                .to_string(),
+            host: args.host.clone(),
+            start,
+            state: state.clone(),
+        };
+        tokio::spawn(async move {
+            if let Err(e) = membership::run(cfg, deadline, fault_deadline).await {
+                error!(error = %format!("{e:#}"), "membership task stopped");
+            }
+        });
+    }
+
+    if !args.canary_interval.is_zero() {
+        let cfg = canary::CanaryConfig {
+            interval: args.canary_interval,
+            host: args.host.clone(),
+            api_port: args.api_port,
+            start,
+            state: state.clone(),
+            service: args.metrics_service.clone(),
+        };
+        tokio::spawn(async move {
+            if let Err(e) = canary::run(cfg, deadline).await {
+                error!(error = %format!("{e:#}"), "canary task stopped");
+            }
+        });
+    }
+
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()?;
@@ -373,6 +910,8 @@ async fn main() -> Result<()> {
         growth_window: args.growth_window,
         max_log_growth_ratio: args.max_log_growth,
         max_disk_spread_ratio: args.max_disk_spread,
+        max_disk_growth_ratio: args.max_disk_growth,
+        min_disk_growth_bytes: args.min_disk_growth,
         min_disk_for_spread: args.min_disk_for_spread,
     });
 
@@ -382,6 +921,13 @@ async fn main() -> Result<()> {
     let mut failed = false;
     // Highest load phase number already judged for its error rate.
     let mut checked_phase = 0u64;
+    let mut checked_chaos = 0u64;
+    let mut checked_latency = 0u64;
+    let mut checked_partition = 0u64;
+    let mut checked_rollout = 0u64;
+    let mut checked_spire = 0u64;
+    let mut checked_membership = 0u64;
+    let mut checked_canary = 0u64;
 
     loop {
         let mut load_failure: Option<String> = None;
@@ -421,7 +967,19 @@ async fn main() -> Result<()> {
                 detail,
             });
         }
+        // A membership scenario rebuilds, demotes or adds nodes on purpose:
+        // the node is unready, lags and is not a voter for a while.
+        if state.read().is_ok_and(|g| g.membership.active) {
+            found.retain(|v| !PLANNED_BY_MEMBERSHIP.contains(&v.check));
+        }
         found.extend(check_load(&state, &mut checked_phase, now, &args));
+        found.extend(check_canary(&state, &mut checked_canary, now));
+        found.extend(check_chaos(&state, &mut checked_chaos, now, &args));
+        found.extend(check_latency(&state, &mut checked_latency, now, &args));
+        found.extend(check_partition(&state, &mut checked_partition, now));
+        found.extend(check_rollout(&state, &mut checked_rollout, now));
+        found.extend(check_spire(&state, &mut checked_spire, now));
+        found.extend(check_membership(&state, &mut checked_membership, now));
         for v in &found {
             error!(check = v.check, detail = %v.detail, "invariant violated");
         }
@@ -504,6 +1062,237 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].check, "load_errors");
         assert!(check_load(&st, &mut checked, Duration::from_secs(2), &args()).is_empty());
+    }
+
+    fn latency_state(read_p99: u64) -> Shared {
+        let st = state_with(1000, 0);
+        if let Ok(mut g) = st.write()
+            && let Some(sum) = g.phases[0].summary.as_mut()
+        {
+            sum.latency_by_class_ms.insert(
+                "read".into(),
+                report::Latency {
+                    requests: 500,
+                    p99: read_p99,
+                    ..report::Latency::default()
+                },
+            );
+        }
+        st
+    }
+
+    #[test]
+    fn flags_slow_p99_once() {
+        let st = latency_state(4000);
+        let mut checked = 0;
+        let found = check_latency(&st, &mut checked, Duration::from_secs(400), &args());
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].check, "latency_p99");
+        assert!(check_latency(&st, &mut checked, Duration::from_secs(400), &args()).is_empty());
+        // Within the limit, or too few requests, is fine.
+        let mut checked = 0;
+        assert!(
+            check_latency(&latency_state(500), &mut checked, Duration::ZERO, &args()).is_empty()
+        );
+    }
+
+    #[test]
+    fn skips_phases_disturbed_by_chaos() {
+        let st = latency_state(4000);
+        if let Ok(mut g) = st.write() {
+            g.chaos.events = vec![chaos::ChaosEvent {
+                seq: 1,
+                pod: "ks-0".into(),
+                at_secs: 100,
+                recovery_secs: Some(30),
+                timed_out: false,
+            }];
+        }
+        let mut checked = 0;
+        assert!(check_latency(&st, &mut checked, Duration::from_secs(400), &args()).is_empty());
+    }
+
+    #[test]
+    fn flags_unrecovered_kill_once() {
+        let st: Shared = Arc::new(RwLock::new(Verdict::default()));
+        let event = |seq, recovery_secs, timed_out| chaos::ChaosEvent {
+            seq,
+            pod: format!("ks-{seq}"),
+            at_secs: 0,
+            recovery_secs,
+            timed_out,
+        };
+        if let Ok(mut g) = st.write() {
+            g.chaos.events = vec![
+                event(1, Some(30), false),
+                event(2, None, true),
+                event(3, None, false),
+            ];
+        }
+        let mut checked = 0;
+        let found = check_chaos(&st, &mut checked, Duration::ZERO, &args());
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].check, "chaos_recovery");
+        // Kill 3 is still recovering and judged later.
+        assert_eq!(checked, 2);
+        assert!(check_chaos(&st, &mut checked, Duration::ZERO, &args()).is_empty());
+    }
+
+    #[test]
+    fn reports_partition_failures_once_settled() {
+        let st: Shared = Arc::new(RwLock::new(Verdict::default()));
+        let event = |seq, done, failed: bool| partition::PartitionEvent {
+            seq,
+            pod: format!("ks-{seq}"),
+            role: "leader",
+            at_secs: 0,
+            effective: true,
+            heal_secs: Some(10),
+            failures: if failed {
+                vec![partition::PartitionFailure {
+                    check: "partition_split_brain",
+                    detail: "acknowledged a write".into(),
+                }]
+            } else {
+                Vec::new()
+            },
+            done,
+        };
+        if let Ok(mut g) = st.write() {
+            g.partition.events = vec![
+                event(1, true, false),
+                event(2, true, true),
+                event(3, false, true),
+            ];
+        }
+        let mut checked = 0;
+        let found = check_partition(&st, &mut checked, Duration::ZERO);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].check, "partition_split_brain");
+        assert_eq!(checked, 2);
+        assert!(check_partition(&st, &mut checked, Duration::ZERO).is_empty());
+    }
+
+    #[test]
+    fn reports_rollout_failures_once_settled() {
+        let st: Shared = Arc::new(RwLock::new(Verdict::default()));
+        let event = |seq, done, failed: bool| rollout::RolloutEvent {
+            seq,
+            at_secs: 0,
+            rolled_secs: Some(60),
+            converged_secs: None,
+            max_write_gap_secs: 90,
+            probes: 10,
+            failed_probes: 4,
+            failures: if failed {
+                vec![rollout::RolloutFailure {
+                    check: "rollout_write_gap",
+                    detail: "no write for 90s".into(),
+                }]
+            } else {
+                Vec::new()
+            },
+            done,
+        };
+        if let Ok(mut g) = st.write() {
+            g.rollout.events = vec![
+                event(1, true, false),
+                event(2, true, true),
+                event(3, false, true),
+            ];
+        }
+        let mut checked = 0;
+        let found = check_rollout(&st, &mut checked, Duration::ZERO);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].check, "rollout_write_gap");
+        assert_eq!(checked, 2);
+        assert!(check_rollout(&st, &mut checked, Duration::ZERO).is_empty());
+    }
+
+    #[test]
+    fn reports_spire_failures_once_settled() {
+        let st: Shared = Arc::new(RwLock::new(Verdict::default()));
+        let event = |seq, done, failed: bool| spire::SpireEvent {
+            seq,
+            pod: format!("agent-{seq}"),
+            at_secs: 0,
+            agent_ready_secs: Some(20),
+            keystone_restarts: u64::from(failed),
+            max_write_gap_secs: 5,
+            failures: if failed {
+                vec![spire::SpireFailure {
+                    check: "spire_keystone_restart",
+                    detail: "1 keystone container restarts".into(),
+                }]
+            } else {
+                Vec::new()
+            },
+            done,
+        };
+        if let Ok(mut g) = st.write() {
+            g.spire.events = vec![
+                event(1, true, false),
+                event(2, true, true),
+                event(3, false, true),
+            ];
+        }
+        let mut checked = 0;
+        let found = check_spire(&st, &mut checked, Duration::ZERO);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].check, "spire_keystone_restart");
+        assert_eq!(checked, 2);
+        assert!(check_spire(&st, &mut checked, Duration::ZERO).is_empty());
+    }
+
+    #[test]
+    fn reports_membership_failures_once_settled() {
+        let st: Shared = Arc::new(RwLock::new(Verdict::default()));
+        let event = |seq, done, failed: bool| membership::MembershipEvent {
+            seq,
+            kind: "wipe",
+            node: format!("ks-{seq}"),
+            at_secs: 0,
+            took_secs: Some(100),
+            max_write_gap_secs: 2,
+            failures: if failed {
+                vec![membership::MembershipFailure {
+                    check: "membership_wiped_voter",
+                    detail: "voter again".into(),
+                }]
+            } else {
+                Vec::new()
+            },
+            done,
+        };
+        if let Ok(mut g) = st.write() {
+            g.membership.events = vec![
+                event(1, true, false),
+                event(2, true, true),
+                event(3, false, true),
+            ];
+        }
+        let mut checked = 0;
+        let found = check_membership(&st, &mut checked, Duration::ZERO);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].check, "membership_wiped_voter");
+        assert_eq!(checked, 2);
+        assert!(check_membership(&st, &mut checked, Duration::ZERO).is_empty());
+    }
+
+    #[test]
+    fn reports_canary_failures_once() {
+        let st: Shared = Arc::new(RwLock::new(Verdict::default()));
+        if let Ok(mut g) = st.write() {
+            g.canary.failures.push(canary::CanaryFailure {
+                seq: 1,
+                at_secs: 0,
+                check: "read_after_write",
+                detail: "x".into(),
+            });
+        }
+        let mut checked = 0;
+        assert_eq!(check_canary(&st, &mut checked, Duration::ZERO).len(), 1);
+        assert!(check_canary(&st, &mut checked, Duration::ZERO).is_empty());
     }
 
     #[test]

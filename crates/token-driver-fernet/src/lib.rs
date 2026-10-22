@@ -11,6 +11,7 @@
 // limitations under the License.
 //
 // SPDX-License-Identifier: Apache-2.0
+// Crypto inventory: TOK-1; see doc/src/contributor/crypto-inventory.md
 //! # Fernet token driver for the `openstack_keystone` crate
 
 use std::collections::BTreeMap;
@@ -233,7 +234,7 @@ impl FernetTokenProvider {
     where
         I: IntoIterator<Item = String>,
     {
-        let me: HashSet<String> = HashSet::from_iter(methods.into_iter());
+        let me: HashSet<String> = HashSet::from_iter(methods);
         let res = self
             .auth_map
             .iter()
@@ -717,6 +718,29 @@ pub mod tests {
         let encrypted = provider.encrypt(&token).unwrap();
         let dec_token = discard_issued_at(provider.decrypt(&encrypted).unwrap());
         assert_eq!(token, dec_token);
+    }
+
+    /// A token whose `expires_at` has whole-second precision (as issued by the
+    /// token service) survives the encrypt/decrypt round trip unchanged, so the
+    /// issue response matches what validation later reports.
+    #[tokio::test]
+    async fn test_roundtrip_expiry_precision_is_stable() {
+        let expires_at = Utc::now().trunc_subsecs(0) + chrono::TimeDelta::hours(1);
+        let token = FernetToken::Unscoped(UnscopedPayload {
+            user_id: Uuid::new_v4().simple().to_string(),
+            methods: vec!["password".into()],
+            audit_ids: vec!["Zm9vCg".into()],
+            expires_at,
+            ..Default::default()
+        });
+        let mut provider = FernetTokenProvider::new(setup_config());
+        provider.load_keys().await.unwrap();
+
+        let dec_token = provider
+            .decrypt(&provider.encrypt(&token).unwrap())
+            .unwrap();
+        assert_eq!(*dec_token.expires_at(), expires_at);
+        assert_eq!(chrono::Timelike::nanosecond(dec_token.expires_at()), 0);
     }
 
     #[tokio::test]

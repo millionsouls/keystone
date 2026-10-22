@@ -1,3 +1,102 @@
+# The chaos task deletes keystone-rs pods, the partition task creates
+# network policies and the rollout task restarts the StatefulSet through the
+# Kubernetes API.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: keystone-soak
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: keystone-soak-chaos
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["create", "get", "list", "delete", "deletecollection"]
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: keystone-soak-chaos
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: keystone-soak-chaos
+subjects:
+  - kind: ServiceAccount
+    name: keystone-soak
+---
+# The membership task runs `keystone-manage storage promote|remove-peer|
+# list-peers` as the storage operator by creating Jobs from the pod template
+# of the keystone-storage-operator Deployment (the pod label grants the
+# operator SPIFFE identity), and deletes the volumes of wiped and surplus
+# nodes. This is the power of the operator role: only bind it in test
+# clusters, and leave SOAK_MEMBERSHIP_INTERVAL at 0 where it is not wanted.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: keystone-soak-membership
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: keystone-soak-membership
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: keystone-soak-membership
+subjects:
+  - kind: ServiceAccount
+    name: keystone-soak
+---
+# The spire task deletes the SPIRE agent pod. The agent is shared node
+# infrastructure in its own namespace, so the permission is separate and only
+# used when SOAK_SPIRE_INTERVAL is set. The subject namespace must be the
+# namespace of the soak deployment.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: keystone-soak-spire
+  namespace: spire
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: keystone-soak-spire
+  namespace: spire
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: keystone-soak-spire
+subjects:
+  - kind: ServiceAccount
+    name: keystone-soak
+    namespace: default
+---
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -16,6 +115,57 @@ data:
   SOAK_PHASES: "steady:5m,burst:1m,idle:5m"
   SOAK_STEADY_USERS: "20"
   SOAK_BURST_USERS: "100"
+  # Canary: write one API key per interval through the service, read it
+  # back from every pod (read-after-write) and re-check the earlier ones
+  # (integrity). `0` disables.
+  SOAK_CANARY_INTERVAL: "30s"
+  # Chaos: delete one keystone-rs pod this often (`0` disables). The pods
+  # are killed in turn, only while all of them are ready, and each must be
+  # ready again within SOAK_CHAOS_RECOVERY or the run fails.
+  SOAK_CHAOS_INTERVAL: "20m"
+  SOAK_CHAOS_RECOVERY: "5m"
+  # Never kill or wipe this pod, so one node keeps an uninterrupted disk
+  # series for judging long-term storage growth (empty disables).
+  SOAK_CONTROL_POD: "keystone-rs-0"
+  # No new fault in the last stretch of the run, so every node can be
+  # judged for disk growth without restarts. Must exceed SOAK_GROWTH_WINDOW
+  # (1h) plus the longest recovery (`0` disables).
+  SOAK_QUIET_WINDOW: "90m"
+  # Partition: cut one node (alternately the leader and a follower) off
+  # from its peers this often by blocking the Raft port with a network
+  # policy (`0` disables). The other nodes must lead and accept writes
+  # within SOAK_PARTITION_ELECTION, the cut node must not acknowledge
+  # writes, and the cluster must converge within SOAK_PARTITION_RECOVERY
+  # after the cut is lifted. Needs a CNI that enforces network policies.
+  SOAK_PARTITION_INTERVAL: "30m"
+  SOAK_PARTITION_DURATION: "60s"
+  SOAK_PARTITION_ELECTION: "60s"
+  SOAK_PARTITION_RECOVERY: "3m"
+  # Rollout: restart the whole keystone-rs StatefulSet (what `kubectl
+  # rollout restart` does) this often (`0` disables). It must finish and the
+  # cluster converge within SOAK_ROLLOUT_TIMEOUT, and no write may be
+  # unacknowledged for longer than SOAK_ROLLOUT_MAX_WRITE_GAP meanwhile.
+  SOAK_ROLLOUT_INTERVAL: "2h"
+  SOAK_ROLLOUT_TIMEOUT: "15m"
+  SOAK_ROLLOUT_MAX_WRITE_GAP: "60s"
+  # SPIRE agent restart: delete the agent pod this often (`0` disables, the
+  # default here because the agent is shared by everything on the node).
+  # Keystone must not restart, writes must keep being acknowledged (longest
+  # gap SOAK_SPIRE_MAX_WRITE_GAP) and the agent must be back within
+  # SOAK_SPIRE_RECOVERY. Namespace and selector: SOAK_SPIRE_NAMESPACE and
+  # SOAK_SPIRE_SELECTOR.
+  SOAK_SPIRE_INTERVAL: "0"
+  SOAK_SPIRE_RECOVERY: "5m"
+  SOAK_SPIRE_MAX_WRITE_GAP: "30s"
+  # Membership churn: alternately wipe a follower (volume and pod) and scale
+  # the StatefulSet from 3 to 5 and back, using the storage operator. `0`
+  # disables, the default here because it needs the operator role (see the
+  # keystone-soak-membership Role). The wiped node must rejoin as a learner
+  # and be promoted, the new nodes must join as learners and be removable,
+  # and every step must finish within SOAK_MEMBERSHIP_TIMEOUT.
+  SOAK_MEMBERSHIP_INTERVAL: "0"
+  SOAK_MEMBERSHIP_TIMEOUT: "10m"
+  SOAK_MEMBERSHIP_MAX_WRITE_GAP: "30s"
   # Keep serving `/verdict` and `/metrics` after the run finished.
   SOAK_LINGER: "1h"
   # Credentials of the bootstrap admin in the dev stack. Replace for other
@@ -45,6 +195,15 @@ spec:
       labels:
         app.kubernetes.io/name: keystone-soak
     spec:
+      serviceAccountName: keystone-soak
+      initContainers:
+        # After a node reboot the soak pod can start before cluster DNS and
+        # keystone are up, which fails the first cycle and the load
+        # generator. Wait until the API answers before starting the run.
+        - name: keystone-waiter
+          image: busybox
+          imagePullPolicy: IfNotPresent
+          command: ['sh', '-c', 'echo "Waiting for keystone-rs..."; while ! nc -z -w 2 keystone-rs 8080; do echo "Still waiting for keystone-rs..."; sleep 3; done; echo "keystone-rs is available."']
       containers:
         - name: soak
           image: keystone-soak

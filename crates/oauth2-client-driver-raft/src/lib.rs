@@ -86,6 +86,11 @@ impl RaftOauth2ClientBackend {
         format!("oauth2:client:v1:{}:", domain_id.as_ref())
     }
 
+    /// Per-domain settings key: `oauth2:domain_settings:v1:<domain_id>`.
+    fn get_domain_settings_key_name<D: AsRef<str>>(&self, domain_id: D) -> String {
+        format!("oauth2:domain_settings:v1:{}", domain_id.as_ref())
+    }
+
     /// Global `client_id` index key:
     /// `oauth2:client:client_id_idx:v1:<client_id>`.
     fn get_client_id_idx_key_name<C: AsRef<str>>(&self, client_id: C) -> String {
@@ -125,6 +130,9 @@ impl RaftOauth2ClientBackend {
             backchannel_logout_session_required: data.backchannel_logout_session_required,
             frontchannel_logout_uri: data.frontchannel_logout_uri,
             frontchannel_logout_session_required: data.frontchannel_logout_session_required,
+            spiffe_ids: data.spiffe_ids,
+            delegation: data.delegation,
+            dpop_bound_access_tokens: data.dpop_bound_access_tokens,
         };
         let primary_key = self.get_resource_key_name(&obj.domain_id, &obj.provider_id);
         let index_key = self.get_client_id_idx_key_name(&obj.client_id);
@@ -259,6 +267,20 @@ impl RaftOauth2ClientBackend {
             .map(|x| x.data))
     }
 
+    async fn list_spiffe_clients_impl(
+        &self,
+        storage: &dyn StorageApi,
+    ) -> Result<Vec<OAuth2ClientResource>, StoreError> {
+        let mut res: Vec<OAuth2ClientResource> = Vec::new();
+        for (_, envelope) in storage.prefix(b"oauth2:client:v1:", None).await? {
+            let candidate = envelope.try_deserialize::<OAuth2ClientResource>()?.data;
+            if candidate.deleted_at.is_none() && !candidate.spiffe_ids.is_empty() {
+                res.push(candidate);
+            }
+        }
+        Ok(res)
+    }
+
     async fn list_impl(
         &self,
         storage: &dyn StorageApi,
@@ -303,6 +325,121 @@ impl RaftOauth2ClientBackend {
             }
         }
         Ok(res)
+    }
+
+    async fn list_delegatable_impl(
+        &self,
+        storage: &dyn StorageApi,
+    ) -> Result<Vec<OAuth2ClientResource>, StoreError> {
+        // A full scan of the client keyspace (ADR 0036 §3). Client counts
+        // are small; an index can replace it if that changes.
+        let mut res: Vec<OAuth2ClientResource> = Vec::new();
+        for (_, envelope) in storage.prefix(b"oauth2:client:v1:", None).await? {
+            let candidate = envelope.try_deserialize::<OAuth2ClientResource>()?.data;
+            if candidate.service_grant_policy().is_some() {
+                res.push(candidate);
+            }
+        }
+        res.sort_by(|a, b| a.client_id.cmp(&b.client_id));
+        Ok(res)
+    }
+
+    async fn get_domain_settings_impl(
+        &self,
+        storage: &dyn StorageApi,
+        domain_id: &str,
+    ) -> Result<Option<OAuth2DomainSettings>, StoreError> {
+        Ok(storage
+            .get_by_key(
+                self.get_domain_settings_key_name(domain_id).as_bytes(),
+                None,
+            )
+            .await?
+            .map(|env| env.try_deserialize::<OAuth2DomainSettings>())
+            .transpose()?
+            .map(|x| x.data))
+    }
+
+    /// Create the settings record on first use, otherwise update it with a
+    /// compare-and-swap on the stored revision.
+    ///
+    /// An update that changes nothing is not written: a domain without a
+    /// record already behaves as if it had the defaults.
+    async fn update_domain_settings_impl(
+        &self,
+        storage: &dyn StorageApi,
+        domain_id: &str,
+        data: OAuth2DomainSettingsUpdate,
+    ) -> Result<OAuth2DomainSettings, StoreError> {
+        let key = self.get_domain_settings_key_name(domain_id);
+        let now = Utc::now().timestamp();
+        let curr = storage
+            .get_by_key(key.as_bytes(), None)
+            .await?
+            .map(|env| env.try_deserialize::<OAuth2DomainSettings>())
+            .transpose()?;
+        let conflict = || StoreError::Conflict {
+            subject: key.clone(),
+            description: format!(
+                "the OAuth2 settings of domain `{domain_id}` were changed concurrently"
+            ),
+        };
+        let (new, mutation) = match curr {
+            Some(curr) => {
+                let new = curr.data.clone().with_update(data, now);
+                if new == curr.data {
+                    return Ok(new);
+                }
+                let mutation = Mutation::set(
+                    key.clone(),
+                    &new,
+                    curr.metadata.new_revision(),
+                    None::<&str>,
+                    Some(curr.metadata.revision),
+                )?;
+                (new, mutation)
+            }
+            None => {
+                let defaults = OAuth2DomainSettings::default_for(domain_id);
+                let new = defaults.clone().with_update(data, now);
+                if new == defaults {
+                    return Ok(new);
+                }
+                let mutation =
+                    Mutation::create_if_absent(key.clone(), &new, Metadata::new(), None::<&str>)?;
+                (new, mutation)
+            }
+        };
+        require_no_conflict(storage.transaction(vec![mutation]).await, conflict)?;
+        Ok(new)
+    }
+
+    /// Remove the settings record, if any, guarded by the stored revision.
+    async fn delete_domain_settings_impl(
+        &self,
+        storage: &dyn StorageApi,
+        domain_id: &str,
+    ) -> Result<(), StoreError> {
+        let key = self.get_domain_settings_key_name(domain_id);
+        let Some(curr) = storage.get_by_key(key.as_bytes(), None).await? else {
+            return Ok(());
+        };
+        require_no_conflict(
+            storage
+                .transaction(vec![Mutation::remove(
+                    key.clone(),
+                    None::<&str>,
+                    Some(curr.metadata.revision),
+                )])
+                .await,
+            || StoreError::Conflict {
+                subject: key,
+                description: format!(
+                    "the OAuth2 settings of domain `{domain_id}` were changed concurrently"
+                ),
+            },
+        )?;
+        Ok(())
     }
 
     async fn rotate_secret_impl(
@@ -468,6 +605,42 @@ impl Oauth2ClientBackend for RaftOauth2ClientBackend {
             .map_err(Oauth2ClientProviderError::raft)
     }
 
+    #[tracing::instrument(
+        name = "driver.raft.oauth2_client.list_spiffe_clients",
+        level = "debug",
+        skip_all
+    )]
+    async fn list_spiffe_clients(
+        &self,
+        state: &ServiceState,
+    ) -> Result<Vec<OAuth2ClientResource>, Oauth2ClientProviderError> {
+        let raft = state
+            .storage
+            .as_deref()
+            .ok_or(Oauth2ClientProviderError::RaftNotAvailable)?;
+        self.list_spiffe_clients_impl(raft)
+            .await
+            .map_err(Oauth2ClientProviderError::raft)
+    }
+
+    #[tracing::instrument(
+        name = "driver.raft.oauth2_client.list_delegatable",
+        level = "debug",
+        skip_all
+    )]
+    async fn list_delegatable(
+        &self,
+        state: &ServiceState,
+    ) -> Result<Vec<OAuth2ClientResource>, Oauth2ClientProviderError> {
+        let raft = state
+            .storage
+            .as_deref()
+            .ok_or(Oauth2ClientProviderError::RaftNotAvailable)?;
+        self.list_delegatable_impl(raft)
+            .await
+            .map_err(Oauth2ClientProviderError::raft)
+    }
+
     #[tracing::instrument(name = "driver.raft.oauth2_client.rotate_secret", level = "debug", skip_all, fields(domain_id = %domain_id, provider_id = %provider_id))]
     async fn rotate_secret<'a>(
         &self,
@@ -500,6 +673,63 @@ impl Oauth2ClientBackend for RaftOauth2ClientBackend {
         self.update_impl(raft, domain_id, provider_id, data)
             .await
             .map_err(|e| map_not_found(e, provider_id))
+    }
+
+    #[tracing::instrument(name = "driver.raft.oauth2_client.get_domain_settings", level = "debug", skip_all, fields(domain_id = %domain_id))]
+    async fn get_domain_settings<'a>(
+        &self,
+        state: &ServiceState,
+        domain_id: &'a str,
+    ) -> Result<Option<OAuth2DomainSettings>, Oauth2ClientProviderError> {
+        let raft = state
+            .storage
+            .as_deref()
+            .ok_or(Oauth2ClientProviderError::RaftNotAvailable)?;
+        self.get_domain_settings_impl(raft, domain_id)
+            .await
+            .map_err(Oauth2ClientProviderError::raft)
+    }
+
+    #[tracing::instrument(name = "driver.raft.oauth2_client.update_domain_settings", level = "debug", skip_all, fields(domain_id = %domain_id))]
+    async fn update_domain_settings<'a>(
+        &self,
+        state: &ServiceState,
+        domain_id: &'a str,
+        data: OAuth2DomainSettingsUpdate,
+    ) -> Result<OAuth2DomainSettings, Oauth2ClientProviderError> {
+        let raft = state
+            .storage
+            .as_deref()
+            .ok_or(Oauth2ClientProviderError::RaftNotAvailable)?;
+        match self
+            .update_domain_settings_impl(raft, domain_id, data)
+            .await
+        {
+            Ok(obj) => Ok(obj),
+            Err(StoreError::Conflict { description, .. }) => {
+                Err(Oauth2ClientProviderError::Conflict(description))
+            }
+            Err(e) => Err(Oauth2ClientProviderError::raft(e)),
+        }
+    }
+
+    #[tracing::instrument(name = "driver.raft.oauth2_client.delete_domain_settings", level = "debug", skip_all, fields(domain_id = %domain_id))]
+    async fn delete_domain_settings<'a>(
+        &self,
+        state: &ServiceState,
+        domain_id: &'a str,
+    ) -> Result<(), Oauth2ClientProviderError> {
+        let raft = state
+            .storage
+            .as_deref()
+            .ok_or(Oauth2ClientProviderError::RaftNotAvailable)?;
+        match self.delete_domain_settings_impl(raft, domain_id).await {
+            Ok(()) => Ok(()),
+            Err(StoreError::Conflict { description, .. }) => {
+                Err(Oauth2ClientProviderError::Conflict(description))
+            }
+            Err(e) => Err(Oauth2ClientProviderError::raft(e)),
+        }
     }
 }
 
@@ -534,6 +764,8 @@ mod tests {
             backchannel_logout_session_required: false,
             frontchannel_logout_uri: None,
             frontchannel_logout_session_required: false,
+            spiffe_ids: vec![],
+            delegation: None,
             client_id: client_id.to_string(),
             provider_id: provider_id.to_string(),
             domain_id: domain_id.to_string(),
@@ -551,6 +783,7 @@ mod tests {
             policy_uri: None,
             tos_uri: None,
             contacts: vec![],
+            dpop_bound_access_tokens: false,
         }
     }
 
@@ -653,6 +886,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_list_delegatable_across_domains() {
+        let backend = RaftOauth2ClientBackend::default();
+        let storage = MockStorage::default();
+        let delegation = DelegationPolicy {
+            service_grants: true,
+            ..Default::default()
+        };
+
+        let mut heat = make_create("heat", "infra", "client-b");
+        heat.delegation = Some(delegation.clone());
+        backend.create_impl(&storage, heat).await.unwrap();
+        let mut local = make_create("local", "tenant", "client-a");
+        local.delegation = Some(delegation.clone());
+        backend.create_impl(&storage, local).await.unwrap();
+        // Not a grantee: no delegation, or delegation without grants.
+        backend
+            .create_impl(&storage, make_create("plain", "infra", "client-c"))
+            .await
+            .unwrap();
+        let mut obo = make_create("obo", "infra", "client-d");
+        obo.delegation = Some(DelegationPolicy {
+            on_behalf_of: true,
+            max_operation_lifetime: Some(60),
+            ..Default::default()
+        });
+        backend.create_impl(&storage, obo).await.unwrap();
+        // Deleted grantee.
+        let mut gone = make_create("gone", "infra", "client-e");
+        gone.delegation = Some(delegation);
+        backend.create_impl(&storage, gone).await.unwrap();
+        backend
+            .delete_impl(&storage, "infra", "gone")
+            .await
+            .unwrap();
+
+        let listed = backend.list_delegatable_impl(&storage).await.unwrap();
+        let ids: Vec<&str> = listed.iter().map(|c| c.client_id.as_str()).collect();
+        assert_eq!(ids, vec!["client-a", "client-b"]);
+    }
+
+    #[tokio::test]
     async fn test_display_metadata_persisted_and_name_filter() {
         let backend = RaftOauth2ClientBackend::default();
         let storage = MockStorage::default();
@@ -700,6 +974,199 @@ mod tests {
         assert_eq!(updated.logo_uri, None);
     }
 
+    #[tokio::test]
+    async fn test_domain_settings_lifecycle() {
+        let backend = RaftOauth2ClientBackend::default();
+        let storage = MockStorage::default();
+
+        assert!(
+            backend
+                .get_domain_settings_impl(&storage, "domain-1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let update = |dpop| OAuth2DomainSettingsUpdate { dpop };
+        let created = backend
+            .update_domain_settings_impl(&storage, "domain-1", update(Some(DpopMode::Optional)))
+            .await
+            .unwrap();
+        assert_eq!(created.dpop, DpopMode::Optional);
+        assert_eq!(
+            backend
+                .get_domain_settings_impl(&storage, "domain-1")
+                .await
+                .unwrap()
+                .unwrap(),
+            created
+        );
+
+        // An empty update keeps the mode; a later one replaces it.
+        let kept = backend
+            .update_domain_settings_impl(&storage, "domain-1", update(None))
+            .await
+            .unwrap();
+        assert_eq!(kept.dpop, DpopMode::Optional);
+        let raised = backend
+            .update_domain_settings_impl(&storage, "domain-1", update(Some(DpopMode::Required)))
+            .await
+            .unwrap();
+        assert_eq!(raised.dpop, DpopMode::Required);
+
+        // Other domains are unaffected.
+        assert!(
+            backend
+                .get_domain_settings_impl(&storage, "domain-2")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        backend
+            .delete_domain_settings_impl(&storage, "domain-1")
+            .await
+            .unwrap();
+        assert!(
+            backend
+                .get_domain_settings_impl(&storage, "domain-1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_domain_settings_empty_update_writes_nothing() {
+        let backend = RaftOauth2ClientBackend::default();
+        let storage = MockStorage::default();
+
+        let unchanged = backend
+            .update_domain_settings_impl(
+                &storage,
+                "domain-1",
+                OAuth2DomainSettingsUpdate::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unchanged, OAuth2DomainSettings::default_for("domain-1"));
+        assert!(
+            backend
+                .get_domain_settings_impl(&storage, "domain-1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// A writer holding a stale view must not overwrite a newer record, and
+    /// a create must not overwrite a record that appeared meanwhile.
+    #[tokio::test]
+    async fn test_domain_settings_conflicts() {
+        let backend = RaftOauth2ClientBackend::default();
+        let storage = MockStorage::default();
+        let key = backend.get_domain_settings_key_name("domain-1");
+        let update = |dpop| OAuth2DomainSettingsUpdate { dpop: Some(dpop) };
+
+        // The record appears between the read and the write of a create.
+        let stale = OAuth2DomainSettings::default_for("domain-1")
+            .with_update(update(DpopMode::Optional), 1);
+        let create = || {
+            Mutation::create_if_absent(key.clone(), &stale, Metadata::new(), None::<&str>).unwrap()
+        };
+        storage.transaction(vec![create()]).await.unwrap();
+        let res = require_no_conflict(storage.transaction(vec![create()]).await, || {
+            StoreError::Conflict {
+                subject: key.clone(),
+                description: String::new(),
+            }
+        });
+        assert!(matches!(res, Err(StoreError::Conflict { .. })));
+
+        // A revision-guarded set and remove fail on a stale revision.
+        let rev = storage
+            .get_by_key(key.as_bytes(), None)
+            .await
+            .unwrap()
+            .unwrap()
+            .metadata
+            .revision;
+        backend
+            .update_domain_settings_impl(&storage, "domain-1", update(DpopMode::Required))
+            .await
+            .unwrap();
+        let stale_set = Mutation::set(
+            key.clone(),
+            &stale,
+            Metadata::new(),
+            None::<&str>,
+            Some(rev),
+        )
+        .unwrap();
+        let res = require_no_conflict(storage.transaction(vec![stale_set]).await, || {
+            StoreError::Conflict {
+                subject: key.clone(),
+                description: String::new(),
+            }
+        });
+        assert!(matches!(res, Err(StoreError::Conflict { .. })));
+        let stale_remove = Mutation::remove(key.clone(), None::<&str>, Some(rev));
+        let res = require_no_conflict(storage.transaction(vec![stale_remove]).await, || {
+            StoreError::Conflict {
+                subject: key.clone(),
+                description: String::new(),
+            }
+        });
+        assert!(matches!(res, Err(StoreError::Conflict { .. })));
+        assert_eq!(
+            backend
+                .get_domain_settings_impl(&storage, "domain-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .dpop,
+            DpopMode::Required
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dpop_bound_access_tokens_persisted_and_updated() {
+        let backend = RaftOauth2ClientBackend::default();
+        let storage = MockStorage::default();
+
+        let created = backend
+            .create_impl(&storage, make_create("provider-1", "domain-1", "client-1"))
+            .await
+            .unwrap();
+        assert!(!created.dpop_bound_access_tokens);
+
+        let mut bound = make_create("provider-2", "domain-1", "client-2");
+        bound.dpop_bound_access_tokens = true;
+        let created = backend.create_impl(&storage, bound).await.unwrap();
+        assert!(created.dpop_bound_access_tokens);
+
+        let update = |value| OAuth2ClientResourceUpdate {
+            dpop_bound_access_tokens: value,
+            ..Default::default()
+        };
+        // `None` leaves the flag unchanged.
+        let unchanged = backend
+            .update_impl(&storage, "domain-1", "provider-2", update(None))
+            .await
+            .unwrap();
+        assert!(unchanged.dpop_bound_access_tokens);
+        let off = backend
+            .update_impl(&storage, "domain-1", "provider-2", update(Some(false)))
+            .await
+            .unwrap();
+        assert!(!off.dpop_bound_access_tokens);
+        let on = backend
+            .update_impl(&storage, "domain-1", "provider-1", update(Some(true)))
+            .await
+            .unwrap();
+        assert!(on.dpop_bound_access_tokens);
+    }
+
     #[test]
     fn test_record_without_display_fields_deserializes() {
         // Records are stored as positional MessagePack arrays; one written
@@ -745,6 +1212,70 @@ mod tests {
         assert_eq!(parsed.name, "");
         assert!(parsed.contacts.is_empty());
         assert_eq!(parsed.display_name(), "prov");
+        assert!(parsed.spiffe_ids.is_empty());
+        assert!(parsed.delegation.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_list_spiffe_clients_spans_domains() {
+        let backend = RaftOauth2ClientBackend::default();
+        let storage = MockStorage::default();
+
+        for (domain, provider) in [("domain-1", "provider-1"), ("domain-2", "provider-2")] {
+            let mut create = make_create(provider, domain, &format!("client-{provider}"));
+            create.token_endpoint_auth_method = "tls_client_auth".into();
+            create.spiffe_ids = vec![format!("spiffe://cloud.example/ns/{provider}")];
+            backend.create_impl(&storage, create).await.unwrap();
+        }
+        // No SPIFFE IDs: not listed.
+        backend
+            .create_impl(&storage, make_create("provider-3", "domain-1", "client-3"))
+            .await
+            .unwrap();
+
+        let listed = backend.list_spiffe_clients_impl(&storage).await.unwrap();
+        assert_eq!(listed.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_delegation_persisted_and_removed() {
+        let backend = RaftOauth2ClientBackend::default();
+        let storage = MockStorage::default();
+
+        let mut create = make_create("provider-1", "domain-1", "client-1");
+        create.token_endpoint_auth_method = "tls_client_auth".into();
+        create.spiffe_ids = vec!["spiffe://cloud.example/ns/nova/sa/*".into()];
+        create.delegation = Some(DelegationPolicy {
+            service_grants: true,
+            cross_domain: true,
+            max_role_ids: vec!["member".into()],
+            max_grant_lifetime: Some(3600),
+            ..Default::default()
+        });
+        backend.create_impl(&storage, create.clone()).await.unwrap();
+
+        let fetched = backend
+            .get_by_client_id_impl(&storage, "client-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fetched.spiffe_ids, create.spiffe_ids);
+        assert_eq!(fetched.delegation, create.delegation);
+
+        let updated = backend
+            .update_impl(
+                &storage,
+                "domain-1",
+                "provider-1",
+                OAuth2ClientResourceUpdate {
+                    remove_delegation: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(updated.delegation.is_none());
+        assert_eq!(updated.spiffe_ids, create.spiffe_ids);
     }
 
     #[tokio::test]

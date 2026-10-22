@@ -11,10 +11,11 @@
 // limitations under the License.
 //
 // SPDX-License-Identifier: Apache-2.0
+// Crypto inventory: STO-9, STO-10; see doc/src/contributor/crypto-inventory.md
 //! # Raft gRPC listener
 use std::sync::Arc;
 
-use color_eyre::eyre::{Report, Result};
+use color_eyre::eyre::{Report, Result, eyre};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
@@ -30,6 +31,12 @@ use openstack_keystone_distributed_storage::{
 };
 
 use crate::server::listener::spiffe_common;
+
+/// HTTP/2 keepalive PING interval and acknowledgement timeout for peer
+/// connections. A peer that vanished without closing its connection (pod
+/// replaced, node power loss) would otherwise keep its replication stream
+/// open here until the kernel gives up on the socket.
+const PEER_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Validate the SPIFFE ID of the peer certificate and resolve its storage role.
 ///
@@ -111,12 +118,12 @@ pub async fn start_raft_app(
 
     let storage_app = get_app_server(&storage).await?;
 
-    // Install aws-lc-rs as the default rustls provider (idempotent).
-    if rustls::crypto::CryptoProvider::get_default().is_none() {
-        let provider = rustls::crypto::aws_lc_rs::default_provider();
-        if rustls::crypto::CryptoProvider::install_default(provider).is_err() {
-            tracing::warn!("Failed to install aws-lc-rs crypto provider");
-        }
+    // Install the build-selected rustls provider (idempotent).
+    if !openstack_keystone_tls_provider::install_default() {
+        tracing::warn!(
+            "Failed to install the {} crypto provider",
+            openstack_keystone_tls_provider::PROVIDER_NAME
+        );
     }
 
     let grpc_addr = ds.node_listener_addr;
@@ -157,8 +164,10 @@ pub async fn start_raft_app(
                 )),
             };
 
-            let mut server =
-                tonic::transport::Server::builder().layer(InterceptorLayer::new(interceptor));
+            let mut server = tonic::transport::Server::builder()
+                .http2_keepalive_interval(Some(PEER_KEEPALIVE))
+                .http2_keepalive_timeout(Some(PEER_KEEPALIVE))
+                .layer(InterceptorLayer::new(interceptor));
             let tonic_router = server.add_routes(storage_app);
 
             tracing::info!(
@@ -167,16 +176,38 @@ pub async fn start_raft_app(
             );
 
             // Build a stream of pre-TLS-wrapped connections.  TLS handshake
-            // failures are logged and skipped; TCP accept errors terminate the
-            // stream and surface to tonic as a transient error.  After
-            // consecutive handshake failures the loop returns `Err` to prevent
-            // a tight retry loop under targeted attacks.
+            // and TCP accept failures are logged and skipped; the stream never
+            // yields an error because tonic would only `trace!` it and then
+            // stop serving.  After consecutive handshake failures each further
+            // failure is delayed to prevent a tight retry loop under targeted
+            // attacks.
             const MAX_CONSECUTIVE_TLS_FAILURES: u32 = 10;
+            const ACCEPT_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
             let incoming = futures_util::stream::try_unfold(
                 (listener, acceptor, 0u32),
                 |(listener, acceptor, mut fail_count)| async move {
                     loop {
-                        let (tcp, _) = listener.accept().await?;
+                        // A failed `accept` (e.g. EMFILE, or a connection
+                        // reset before it was accepted) must not end this
+                        // stream: tonic only `trace!`s stream errors and then
+                        // treats the ended stream as a graceful stop, which
+                        // would silently kill the Raft listener while the
+                        // process keeps running.
+                        let tcp = match listener.accept().await {
+                            Ok((tcp, _)) => tcp,
+                            Err(e) => {
+                                tracing::warn!("Raft gRPC accept failed: {e}");
+                                tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                                continue;
+                            }
+                        };
+                        // Avoid Nagle + delayed ACK stalls (~40ms) on small
+                        // RPC responses. Best effort: the peer may already
+                        // have reset the connection.
+                        if let Err(e) = tcp.set_nodelay(true) {
+                            tracing::warn!("Raft gRPC set_nodelay failed: {e}");
+                            continue;
+                        }
                         match acceptor.accept(tcp).await {
                             Ok(tls) => {
                                 return Ok::<_, std::io::Error>(Some((
@@ -188,10 +219,10 @@ pub async fn start_raft_app(
                                 fail_count += 1;
                                 tracing::warn!("Raft gRPC TLS handshake failed: {e}");
                                 if fail_count >= MAX_CONSECUTIVE_TLS_FAILURES {
-                                    return Err(std::io::Error::other(format!(
-                                        "giving up after {MAX_CONSECUTIVE_TLS_FAILURES} \
-                                             consecutive TLS handshake failures"
-                                    )));
+                                    // Throttle instead of giving up: ending
+                                    // the stream would stop the listener
+                                    // without any error being reported.
+                                    tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
                                 }
                             }
                         }
@@ -200,16 +231,22 @@ pub async fn start_raft_app(
             );
 
             _ = bound_signal.send(true);
+            let shutdown_token = cancel_token.clone();
             tonic_router
                 .serve_with_incoming_shutdown(incoming, async move {
-                    cancel_token.cancelled().await;
+                    shutdown_token.cancelled().await;
                 })
                 .await?;
+            if !cancel_token.is_cancelled() {
+                return Err(eyre!("Raft gRPC listener stopped unexpectedly"));
+            }
         }
 
         RaftTlsConfiguration::Tls(_) => {
-            let mut server =
-                tonic::transport::Server::builder().tls_config(get_server_tls_config(ds)?)?;
+            let mut server = tonic::transport::Server::builder()
+                .http2_keepalive_interval(Some(PEER_KEEPALIVE))
+                .http2_keepalive_timeout(Some(PEER_KEEPALIVE))
+                .tls_config(get_server_tls_config(ds)?)?;
             let tonic_router = server.add_routes(storage_app);
 
             tracing::info!("Starting distributed storage at {:?}", grpc_addr);

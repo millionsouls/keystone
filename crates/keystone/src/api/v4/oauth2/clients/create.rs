@@ -116,6 +116,8 @@ mod tests {
             backchannel_logout_session_required: false,
             frontchannel_logout_uri: None,
             frontchannel_logout_session_required: false,
+            spiffe_ids: vec![],
+            delegation: None,
             client_id: "client-1".into(),
             provider_id: "provider-1".into(),
             domain_id: "domain_id".into(),
@@ -138,6 +140,7 @@ mod tests {
             policy_uri: None,
             tos_uri: None,
             contacts: vec![],
+            dpop_bound_access_tokens: false,
         }
     }
 
@@ -149,6 +152,8 @@ mod tests {
                 backchannel_logout_session_required: false,
                 frontchannel_logout_uri: None,
                 frontchannel_logout_session_required: false,
+                spiffe_ids: vec![],
+                delegation: None,
                 provider_id: "provider-1".into(),
                 confidential,
                 redirect_uris: vec!["https://rp.example.com/callback".into()],
@@ -164,6 +169,7 @@ mod tests {
                 policy_uri: None,
                 tos_uri: None,
                 contacts: vec![],
+                dpop_bound_access_tokens: false,
             },
         }
     }
