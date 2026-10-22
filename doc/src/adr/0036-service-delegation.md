@@ -624,10 +624,14 @@ accepts an application-credential subject and rejects everything else.
    bearer token (expiry, revocation, user enabled). When the subject is itself
    an on-behalf-of token, its `delegation_context.root_jti` is checked against
    the revocation store as well (§6.3).
-2. The subject's chain must be plain, application-credential, or an on-behalf-of
-   token previously minted **for the same actor** (§6.3). A trust,
-   service-grant, or on-behalf-of-for-another-actor subject is rejected: no
-   re-delegation.
+2. The subject's chain must be plain, unrestricted application-credential, or an
+   on-behalf-of token previously minted **for the same actor** (§6.3). A trust,
+   service-grant, restricted application credential, or
+   on-behalf-of-for-another-actor subject is rejected: no re-delegation, and a
+   restriction cannot be carried along. The exchanged token is always treated as
+   delegated by policy (`is_delegated`), even for a plain subject, so the rules
+   that bound a delegated caller (trusts, credentials, EC2) apply to a token a
+   service holds.
 3. `sub` = the subject's user id; `act` = this client, with `sub_type: "spiffe"`
    as in §5.2; `amr` = the **set union** of the subject's `amr` and
    `on_behalf_of` — a union, not an append, so a chain re-exchanged twenty times
@@ -650,7 +654,12 @@ accepts an application-credential subject and rejects everything else.
    time, which is the point of §7.
 
 5. `auth_time` and `root_jti` are taken from the subject on the first hop and
-   preserved unchanged on every re-exchange (§6.3).
+   preserved unchanged on every re-exchange (§6.3). A rescoped token has a fresh
+   `issued_at` but inherits its parent's expiry, so `auth_time` is the earlier
+   of `issued_at` and `expires_at` less the token lifetime, so rescoping cannot
+   extend the chain. `root_jti` is the token's first audit id, the key its
+   revocation events are recorded under; revocation by audit chain is not
+   matched anywhere in Keystone, so revoking a parent does not end the chain.
 
 #### 6.3 Renewal without a stored record
 
@@ -671,7 +680,9 @@ hop then re-runs, against `keystone-rs`:
    gets, applied to the _root_ identifier rather than to the hop token that was
    presented).
 2. The user is enabled, the domain is enabled.
-3. Live role and delegation-boundary checks, as on the first hop.
+3. When the chain started from an application credential, the credential still
+   exists and has not expired (`delegation_context` carries its id).
+4. Live role and delegation-boundary checks, as on the first hop.
 
 Without the `root_jti` binding, re-exchange would present a _different_ token
 than the one the user handed over, with a different `jti`, and an explicit
@@ -803,6 +814,7 @@ OnBehalfOf   {
     subject: Box<AuthenticationContext>,
     auth_time: DateTime<Utc>,
     root_jti: String,   // §6.3: the chain is revoked with the token that started it
+    application_credential_id: Option<String>, // §6.3: rechecked on every hop
 },
 ```
 
@@ -1155,6 +1167,56 @@ Where the phase 1 implementation refines or departs from the decision above:
 - **List filter.** `domain_id` on `GET /v4/service-grants` filters on the
   grant's domain, which is the target project's domain. Domain managers
   are authorized on that same domain.
+
+### Phase 2 design: on-behalf-of exchange
+
+How phase 2 implements §6, and where it refines the text above.
+
+- **Subjects.** `subject_token_type` is dispatched. Phase 2 accepts
+  `urn:openstack:params:oauth:token-type:keystone` (Fernet or JWS v3 token,
+  validated with `TokenApi::validate_to_context`, which also checks
+  revocation) and the hop token of an earlier exchange by the same actor
+  (`urn:ietf:params:oauth:token-type:access_token`, verified against the
+  issuing domain's JWKS and `revoked_jtis`). A user-issued JWT access token as
+  the first hop needs the validation profile of §6.4 and is left to it.
+- **Client authentication.** An on-behalf-of exchange is authenticated with
+  `tls_client_auth` on the internal interface, like redemption: the request
+  names the `client_id`, the SVID must match its `spiffe_ids`, and its
+  `delegation.on_behalf_of` must be set. The existing secret-authenticated
+  exchange of an application-credential token keeps working unchanged.
+- **Context shape.** `AuthenticationContext::OnBehalfOf` carries
+  `actor`, `delegated_project_id: Option<String>`,
+  `delegated_role_ids: Option<Vec<String>>`, the subject's `methods`,
+  `auth_time` and `root_jti`, not a boxed subject context. A hop token cannot
+  be turned back into the original context (an application credential record
+  is not reachable from the claims), and everything a decision needs is these
+  facts. `validate_scope_boundaries` allows a project scope only when
+  `delegated_project_id` is unset or equal to it.
+- **Role bound.** An application-credential subject's roles travel with the
+  chain (`delegated_role_ids`, also a claim), so every hop's effective roles
+  are the user's live roles intersected with them (§6.2 names the project
+  boundary only; without the roles a re-exchange would widen the credential).
+- **Claims.** `delegation_context` gains an `on_behalf_of` variant with
+  `actor_client_id`, `auth_time`, `root_jti` and the optional
+  `delegated_project_id` and `delegated_role_ids`; `act` is the SVID; `amr` is the union of the
+  subject's methods and `on_behalf_of`.
+- **Root revocation.** The chain's audit id is `root_jti`, so
+  `RevokeApi::is_token_revoked` runs unchanged on every hop, together with
+  the user, domain and live role checks.
+- **Lifetime.** A hop is refused once
+  `now >= auth_time + max_operation_lifetime`, and the token's `exp` never
+  passes that bound.
+- **Scope domain.** The subject's scope must belong to the domain whose
+  endpoint is called, as for the existing exchange. A client of another
+  domain needs `cross_domain`.
+- **Limits.** Rate limiting is keyed `on_behalf_of:<svid>`; audit uses the
+  `on_behalf_of` target type with `authenticate`.
+- **Ceilings.** `max_role_ids` bounds grants only: the user's own token is
+  the consent for an exchange, so the roles are the user's (or the
+  credential's), not the client's.
+- **Known gap.** Re-exchange does not re-read the application credential of
+  an application-credential chain; the credential's deletion ends the chain
+  through the root revocation only if the deletion revokes its tokens.
 
 ## Alternatives considered
 

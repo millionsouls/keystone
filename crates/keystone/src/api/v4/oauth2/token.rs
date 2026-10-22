@@ -28,6 +28,7 @@ mod common;
 pub(super) use common::sign_jwt_typed;
 mod device_code;
 mod error;
+mod on_behalf_of;
 mod refresh_token;
 mod service_grant;
 #[cfg(test)]
@@ -56,11 +57,13 @@ use super::well_known::ensure_trusted_issuer;
 
 use authorization_code::handle_authorization_code_grant;
 use client_credentials::handle_client_credentials_grant;
+use common::client_credentials_from_request;
 pub(super) use common::{
     authenticate_client, client_credentials_from_parts, validate_device_code_client,
 };
 use device_code::handle_device_code_grant;
 pub(super) use error::Oauth2TokenError;
+use on_behalf_of::handle_on_behalf_of_grant;
 use refresh_token::handle_refresh_token_grant;
 use service_grant::{SERVICE_GRANT_GRANT_TYPE, handle_service_grant_grant};
 use token_exchange::handle_token_exchange_grant;
@@ -231,80 +234,105 @@ pub(super) async fn token(
 
     let oauth2_cfg = state.config_manager.config.read().await.oauth2.clone();
 
-    let result = match grant_type {
-        "client_credentials" => {
-            handle_client_credentials_grant(
-                &state,
-                &domain_id,
-                &headers,
-                &form,
-                &oauth2_cfg,
-                &correlation_id.0,
-            )
-            .await
+    // A service that authenticated with its SVID on the internal interface
+    // and presents no secret exchanges on behalf of a user (ADR 0036 §6);
+    // every other caller keeps the secret-authenticated exchange of a
+    // delegated credential.
+    let on_behalf_of_svid = svid.as_ref().filter(|_| {
+        grant_type == "urn:ietf:params:oauth:grant-type:token-exchange"
+            && interface
+                .as_ref()
+                .is_some_and(|Extension(i)| *i == Interface::Internal)
+            && client_credentials_from_request(&headers, &form)
+                .is_none_or(|(_, secret)| secret.is_none())
+    });
+    let result = if let Some(Extension(svid)) = on_behalf_of_svid {
+        handle_on_behalf_of_grant(
+            &state,
+            &domain_id,
+            &headers,
+            &form,
+            &oauth2_cfg,
+            &correlation_id.0,
+            svid,
+        )
+        .await
+    } else {
+        match grant_type {
+            "client_credentials" => {
+                handle_client_credentials_grant(
+                    &state,
+                    &domain_id,
+                    &headers,
+                    &form,
+                    &oauth2_cfg,
+                    &correlation_id.0,
+                )
+                .await
+            }
+            "authorization_code" => {
+                handle_authorization_code_grant(
+                    &state,
+                    &domain_id,
+                    &headers,
+                    &form,
+                    &oauth2_cfg,
+                    &correlation_id.0,
+                )
+                .await
+            }
+            "refresh_token" => {
+                handle_refresh_token_grant(
+                    &state,
+                    &domain_id,
+                    &headers,
+                    peer_addr,
+                    &form,
+                    &oauth2_cfg,
+                    &correlation_id.0,
+                )
+                .await
+            }
+            "urn:ietf:params:oauth:grant-type:token-exchange" => {
+                handle_token_exchange_grant(
+                    &state,
+                    &domain_id,
+                    &headers,
+                    &form,
+                    &oauth2_cfg,
+                    &correlation_id.0,
+                )
+                .await
+            }
+            "urn:ietf:params:oauth:grant-type:device_code" => {
+                handle_device_code_grant(
+                    &state,
+                    &domain_id,
+                    &headers,
+                    peer_addr,
+                    &form,
+                    &oauth2_cfg,
+                    &correlation_id.0,
+                )
+                .await
+            }
+            SERVICE_GRANT_GRANT_TYPE => {
+                handle_service_grant_grant(
+                    &state,
+                    &domain_id,
+                    &headers,
+                    &form,
+                    &oauth2_cfg,
+                    &correlation_id.0,
+                    interface.map_or(Interface::Public, |Extension(i)| i),
+                    svid.as_ref().map(|Extension(s)| s),
+                )
+                .await
+            }
+            other => Err(Oauth2TokenError::unsupported_grant_type(format!(
+                "grant_type `{other}` is not supported"
+            ))),
         }
-        "authorization_code" => {
-            handle_authorization_code_grant(
-                &state,
-                &domain_id,
-                &headers,
-                &form,
-                &oauth2_cfg,
-                &correlation_id.0,
-            )
-            .await
-        }
-        "refresh_token" => {
-            handle_refresh_token_grant(
-                &state,
-                &domain_id,
-                &headers,
-                peer_addr,
-                &form,
-                &oauth2_cfg,
-                &correlation_id.0,
-            )
-            .await
-        }
-        "urn:ietf:params:oauth:grant-type:token-exchange" => {
-            handle_token_exchange_grant(
-                &state,
-                &domain_id,
-                &headers,
-                &form,
-                &oauth2_cfg,
-                &correlation_id.0,
-            )
-            .await
-        }
-        "urn:ietf:params:oauth:grant-type:device_code" => {
-            handle_device_code_grant(
-                &state,
-                &domain_id,
-                &headers,
-                peer_addr,
-                &form,
-                &oauth2_cfg,
-                &correlation_id.0,
-            )
-            .await
-        }
-        SERVICE_GRANT_GRANT_TYPE => {
-            handle_service_grant_grant(
-                &state,
-                &domain_id,
-                &headers,
-                &form,
-                &oauth2_cfg,
-                &correlation_id.0,
-                interface.map_or(Interface::Public, |Extension(i)| i),
-                svid.as_ref().map(|Extension(s)| s),
-            )
-            .await
-        }
-        other => Err(Oauth2TokenError::unsupported_grant_type(format!(
-            "grant_type `{other}` is not supported"
-        ))),
     };
     record_token_metrics(&domain_id, grant_type, started, result.as_ref().err());
     result.map(no_store)
