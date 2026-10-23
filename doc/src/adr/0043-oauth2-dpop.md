@@ -121,8 +121,11 @@ to two slots. Resource servers do not use nonces in this version.
 
 Proof verification costs a signature check before the client is
 authenticated, so it runs behind the pre-hash rate limit of ADR 0022: the
-limit is applied to the source and to the unverified `jkt` before the
-signature is checked, and invalid proofs count against it.
+limit is applied to the source before the signature is checked, and invalid
+proofs count against it. A per-key throttle applies to the `jkt` only after the
+signature is verified: an unverified `jkt` is attacker chosen (the thumbprint
+of a key is public in `cnf.jkt`), so throttling on it would let a flood of
+forged proofs exhaust a victim's bucket.
 
 ### 3. Token endpoint
 
@@ -174,9 +177,9 @@ signature is checked, and invalid proofs count against it.
   requesting client uses DPoP, and is otherwise issued unbound only if the
   effective mode (section 1) is not `required`.
 - The `dpop_required` lookup fails closed: if the discovery document cannot be
-  fetched and the cached copy is older than its TTL (60 s, shorter than the
-  discovery `Cache-Control`), the request is rejected, so interfering with the
-  fetch cannot downgrade enforcement.
+  fetched and the cached copy is older than its TTL (60 s, no longer than the
+  discovery `Cache-Control`, so a shared cache cannot stretch it), the request
+  is rejected, so interfering with the fetch cannot downgrade enforcement.
 
 ### 5. Client protocol
 
@@ -262,6 +265,27 @@ DPoP: P(htm=GET, htu=https://nova.example/v2.1/servers, ath=b64url(SHA-256(acces
 - Binding of Fernet tokens and of Horizon cookie sessions.
 - An X.509 CA for end users and RFC 8705 for them. If ever needed it would be a
   dedicated issuer with its own keys; the OAuth2 signing keys are not reused.
+
+## Implementation notes
+
+The implementation differs from the text above in these points:
+
+- The proof at `/token` is verified after client authentication, not before.
+  An unauthenticated caller therefore never reaches the proof or nonce logic.
+- A `subject_token` carrying `cnf` at the token exchange endpoint is refused
+  instead of being accepted with an `ath` proof (section 4). A bound token
+  cannot be traded for an unbound one.
+- Introspection reports a bound token with `token_type: DPoP` and `cnf.jkt`
+  and does not issue a challenge; the introspecting service decides.
+- Service grant tokens are never bound and are not affected by the `required`
+  mode.
+- The downstream `dpop_required` cache takes the discovery fetch from the
+  caller, so the core crate stays free of network I/O. A stale value is not
+  served; a failed refresh rejects the request.
+- Updating the domain mode is read-modify-write without compare-and-set. A
+  manager raising the mode from a stale read can race an administrator
+  lowering it and win. The window is the provider round trip.
+- Resource servers do not use nonces; the replay cache is per node.
 
 ## Consequences
 
