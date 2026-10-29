@@ -483,6 +483,15 @@ one of the client's `spiffe_ids`, and only for the grant being accessed.
   `SecurityContext::validate()`, expiry, trust-chain validation, role resolution
   — so it is the safe path when in doubt. A validated context is only obtainable
   via `new_for_scope()` / `test_new()` (test-only).
+- **Multi-factor rules are checked at issuance, from the chain.** Token
+  creation on `/v3/auth/tokens` compares the methods carried by the
+  `SecurityContext` (`auth_methods()`, which includes the methods of a parent
+  token) with the user's `multi_factor_auth_rules` (`enforce_mfa_rules`). Delegations
+  (application credentials, trusts, EC2 credentials) and machine identities
+  (K8s, SPIFFE) are exempt, and a passkey login counts as multi-factor on its
+  own. Federation relies on the external IdP. The OAuth2 login (v4 API, no
+  Python compatibility contract) applies its own second-factor check. A new entry point that issues a user token must
+  decide explicitly whether it honours the rules.
 
 ## 7. Reviewer checklist
 
@@ -555,28 +564,10 @@ carries it, ticked by the reviewer, not just this prose reference.
 
 ## 9. Known open gaps
 
-- **`input.credentials.system_scope` is a dead key in several policies.**
-  `Credentials.system` (`crates/core/src/policy.rs`) serializes the system
-  scope under the field name `system`; nothing ever emits `system_scope`, so
-  any rule comparing against it is unreachable. It fails *closed* (access is
-  denied, never granted), so this is a functional gap rather than a
-  vulnerability. `policy/policy/*.rego` uses the correct
-  `input.credentials.system`.
-
-  The affected rules are **not** uniform, and a global key rename would be
-  wrong. Each needs checking against the python default it is meant to mirror:
-
-  | Rego | Python default | Effect of the dead key |
-  | --- | --- | --- |
-  | `assignment/list` | `RULE_ADMIN_OR_SYSTEM_READER` | Real: system reader is denied |
-  | `auth/token/show` | admin or token owner, plus system reader | Real: system reader is denied |
-  | `endpoint/{list,show}` | `RULE_ADMIN_OR_SYSTEM_READER` | Real: system reader is denied |
-  | `service/{list,show}` | `RULE_ADMIN_OR_SYSTEM_READER` | Real: system reader is denied |
-  | `auth/project/list` | any valid token | None — the rego is `default allow := true`, so nothing is denied |
-  | `region/{list,show}` | `check_str=''` (any valid token) | Different bug: the rego is `default allow := false`, so it is *stricter* than python regardless of the key; renaming would not fix it |
-
-  Needs a follow-up issue for an endpoint-by-endpoint audit against the
-  [Identity API policy reference](https://docs.openstack.org/keystone/latest/configuration/policy.html),
-  not a blanket search-and-replace. This class of bug is exactly what the Gate
-  B3 real-`opa run` handler tests catch and hand-written Rego unit tests
-  cannot.
+- **None open for policy input keys.** The former `input.credentials.system_scope`
+  dead key (policies compared against a key `Credentials` never emits, so
+  system readers were denied) was fixed in #1048: all policies use
+  `input.credentials.system`. `region/{list,show}` were additionally stricter
+  than the python default (`check_str=''`, any valid token) and now allow any
+  authenticated caller. The Gate B3 real-`opa run` handler tests remain the
+  control for this class of handler↔policy key mismatch.

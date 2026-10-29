@@ -3,8 +3,6 @@
 # description: Policy for listing catalog regions
 package identity.region.list
 
-import data.identity
-
 # List regions.
 #
 # The `input.target.region` contains query parameters (RegionListParameters):
@@ -12,22 +10,10 @@ import data.identity
 #
 # The `input.existing` is null
 #
+# Any caller holding a valid token may read regions: python-keystone's
+# default is `check_str=''`. No role or scope is required.
 default allow := false
 
-# METADATA
-# description: "`Admin` is allowed by default"
 allow if {
-	"admin" in input.credentials.roles
-}
-
-allow if {
-	input.credentials.is_admin
-}
-
-# METADATA
-# description: "'reader' in the system scope can list any regions."
-allow if {
-	"reader" in input.credentials.roles
-	input.credentials.system != null
-	"all" == input.credentials.system
+	input.credentials.user_id != ""
 }

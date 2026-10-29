@@ -7,13 +7,13 @@
 [IAM data plane and check API design](iam-data-plane.md)
 [Public KMS architecture](kms-vision.md)
 
----
+______________________________________________________________________
 
 # Installation Guides
 
 - [Installation](install/index.md)
 
----
+______________________________________________________________________
 
 # General Information
 
@@ -22,7 +22,7 @@
   - [Compatibility](getting-started/compatibility.md)
   - [Performance comparison](getting-started/performance.md)
 
----
+______________________________________________________________________
 
 # User Documentation
 
@@ -40,7 +40,7 @@
   - [Kubernetes TokenReview Authentication](user/features/kubernetes-auth.md)
   - [Identity Mapping Rules and API](user/features/identity-mapping.md)
 
----
+______________________________________________________________________
 
 # Administrator Guides
 
@@ -52,10 +52,13 @@
     - [`keystone`](admin/cli/keystone.md)
     - [`keystone-manage`](admin/cli/keystone-manage.md)
   - [Security](admin/security.md)
+    - [Security reference](admin/security-reference.md)
+  - [Verifying release artifacts](admin/verify-artifacts.md)
   - [API policy enforcement](admin/policy.md)
   - [Fernet tokens](admin/tokens/fernet.md)
   - [Distributed encrypted storage](admin/storage/distributed.md)
   - [Passkeys](admin/features/passkeys.md)
+  - [Multi-factor authentication rules](admin/features/mfa.md)
   - [Federation](admin/features/federation/index.md)
     - [Keycloak](admin/features/federation/keycloak.md)
     - [Okta](admin/features/federation/okta.md)
@@ -72,20 +75,20 @@
   - [OpenTelemetry](admin/features/opentelemetry.md)
   - [Observability](admin/features/observability.md)
 
----
+______________________________________________________________________
 
 # Configuration Options
 
 - [Configuration reference](configuration/index.md)
   - [Configuration options](configuration/options.md)
 
----
+______________________________________________________________________
 
 # API Reference
 
 - [OpenAPI and Swagger UI](./swagger-ui.html)
 
----
+______________________________________________________________________
 
 # Contributor Documentation
 
@@ -99,6 +102,13 @@
   - [Authentication plugin development](contributor/auth-plugins.md)
   - [Security model](contributor/security-model.md)
   - [Crypto inventory and FIPS](contributor/crypto-inventory.md)
+  - [Cyber Resilience Act requirements](contributor/cra-requirements.md)
+    - [Cybersecurity policy](contributor/cybersecurity-policy.md)
+    - [Technical file index](contributor/cra-technical-file.md)
+    - [Support policy](contributor/support-policy.md)
+    - [VEX statements](contributor/vex.md)
+    - [CRA Art. 14 reporting runbook](contributor/cra-art14-runbook.md)
+  - [NIS2 requirements](contributor/nis2-requirements.md)
   - [Security architecture review](contributor/security-review.md)
   - [Architecture Decision Records](adr/index.md)
     - [Record architecture decisions](adr/0001-record-architecture-decisions.md)

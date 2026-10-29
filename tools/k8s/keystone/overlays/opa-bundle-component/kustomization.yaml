@@ -1,0 +1,40 @@
+# Load the OPA policy from the cosign-signed `opa-bundle` instead of the
+# policies baked into the `keystone-opa` image. An init container resolves the
+# bundle tag to a digest, runs `cosign verify` against this repository's GitHub
+# Actions identity and writes an OPA config pinned to that digest, so OPA only
+# ever loads a verified bundle (Gate H, load side; CRA Annex I Part I (f)).
+#
+# Add it to an overlay with:
+#
+#   components:
+#     - ../opa-bundle-component
+#
+# The pod needs egress to ghcr.io and the Sigstore endpoints (TUF root,
+# Fulcio/Rekor transparency log). See doc/src/admin/verify-artifacts.md.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+# The verifier is the root of trust for the bundle, so it is referenced by
+# digest, not by a tag that any push to main can move. The all-zero digest
+# never resolves and the pod stays in ImagePullBackOff until it is pinned
+# (fail closed, like `tools/opa_config.yaml`). Pin it in your overlay:
+#
+#   1. Resolve a release tag or commit tag to a digest:
+#        crane digest ghcr.io/openstack-experimental/keystone-bundle-verify:sha-<commit>
+#   2. Check its build provenance:
+#        gh attestation verify \
+#          oci://ghcr.io/openstack-experimental/keystone-bundle-verify@sha256:<digest> \
+#          --repo openstack-experimental/keystone
+#   3. Set `digest` below (or override it in your overlay).
+#
+# The image is published for linux/amd64 and linux/arm64.
+images:
+  - name: keystone-bundle-verify
+    newName: ghcr.io/openstack-experimental/keystone-bundle-verify
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+
+patches:
+  - target:
+      kind: StatefulSet
+      name: keystone-rs
+    path: statefulset-patch.yaml
