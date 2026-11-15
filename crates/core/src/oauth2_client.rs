@@ -44,7 +44,10 @@ pub use hook::Oauth2ClientHook;
 pub use id_token::{IdTokenClaimsError, IdTokenParams, TemplateScope, build_id_token_claims};
 pub use provider_api::Oauth2ClientApi;
 pub use service::Oauth2ClientService;
-pub use token::{build_access_token_claims, hydrate_client_credentials_context};
+pub use token::{
+    build_access_token_claims, build_external_assertion_claims, hydrate_client_credentials_context,
+    hydrate_external_assertion_context,
+};
 pub use token_exchange::{TokenExchangeError, build_token_exchange_claims, validate_subject_token};
 pub use verify::{
     IntrospectedAccessToken, RevocableAccessToken, SubjectTokenValidationProfile,

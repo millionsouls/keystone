@@ -401,10 +401,36 @@ impl MappingService {
         ruleset: &MappingRuleSet,
         req: &MappingAuthRequest,
     ) -> Result<AuthenticationResult, MappingProviderError> {
-        let IdentitySource::Federation { idp_id } = &req.source else {
-            return Err(MappingProviderError::LocalIdentityRequiresFederation(
-                req.source.to_string_key(),
-            ));
+        let idp_id = match &req.source {
+            IdentitySource::Federation { idp_id } => idp_id.clone(),
+            IdentitySource::TokenExchange { issuer } => {
+                let request_domain = req.domain_id.as_deref().ok_or(
+                    MappingProviderError::LocalIdentityRequiresFederation(
+                        req.source.to_string_key(),
+                    ),
+                )?;
+                state
+                    .provider
+                    .get_federation_provider()
+                    .get_identity_provider_by_issuer(
+                        &ExecutionContext::internal(state),
+                        request_domain,
+                        issuer,
+                    )
+                    .await
+                    .map_err(MappingProviderError::driver)?
+                    .ok_or_else(|| {
+                        MappingProviderError::LocalIdentityRequiresFederation(
+                            req.source.to_string_key(),
+                        )
+                    })?
+                    .id
+            }
+            _ => {
+                return Err(MappingProviderError::LocalIdentityRequiresFederation(
+                    req.source.to_string_key(),
+                ));
+            }
         };
 
         let domain_id = match_result
@@ -418,7 +444,7 @@ impl MappingService {
         let user = self
             .find_or_create_federated_user(
                 state,
-                idp_id,
+                &idp_id,
                 &domain_id,
                 &match_result.user_name,
                 &req.unique_workload_id,
@@ -427,7 +453,7 @@ impl MappingService {
 
         // Always sync group memberships to reflect current claims, not just
         // on first-time creation.
-        self.sync_user_groups(state, &user, match_result, idp_id)
+        self.sync_user_groups(state, &user, match_result, &idp_id)
             .await?;
 
         let user_groups = state

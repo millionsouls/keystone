@@ -135,6 +135,77 @@ pub async fn hydrate_client_credentials_context(
     Ok((vsc, ruleset.ruleset_version))
 }
 
+/// Run an external assertion's verified claims through the domain's token
+/// exchange mapping ruleset and return a fully hydrated security context.
+pub async fn hydrate_external_assertion_context(
+    state: &ServiceState,
+    domain_id: &str,
+    issuer: &str,
+    subject: &str,
+    claims: HashMap<String, Vec<String>>,
+) -> Result<(ValidatedSecurityContext, u128), AuthenticationError> {
+    let source = IdentitySource::TokenExchange {
+        issuer: issuer.to_string(),
+    };
+    let exec = ExecutionContext::internal(state);
+    let ruleset = state
+        .provider
+        .get_mapping_provider()
+        .get_ruleset_by_source(&exec, domain_id, &source)
+        .await
+        .map_err(|e| AuthenticationError::Provider {
+            source: Box::new(e),
+            context: Some("external assertion mapping ruleset lookup".to_string()),
+        })?
+        .ok_or(AuthenticationError::Unauthorized)?;
+
+    if !ruleset.enabled {
+        return Err(AuthenticationError::Unauthorized);
+    }
+
+    let match_result =
+        engine::evaluate_ruleset(&ruleset, &claims, ruleset.domain_id.as_deref(), None).map_err(
+            |e| AuthenticationError::Provider {
+                source: Box::new(e),
+                context: Some("external assertion mapping evaluation".to_string()),
+            },
+        )?;
+    let authorization = match &match_result {
+        None => return Err(AuthenticationError::NoAuthorizationsFound),
+        Some(mr) if mr.authorizations.is_empty() => {
+            return Err(AuthenticationError::NoAuthorizationsFound);
+        }
+        Some(mr) if mr.authorizations.len() > 1 => {
+            return Err(AuthenticationError::MultipleScopesForbidden);
+        }
+        Some(mr) => &mr.authorizations[0],
+    };
+
+    let scope = scope_info_from_authorization(state, &exec, authorization).await?;
+    scope.validate()?;
+
+    let mapping_req = MappingAuthRequest {
+        domain_id: Some(domain_id.to_string()),
+        source,
+        unique_workload_id: subject.to_string(),
+        claims,
+        rule_name: None,
+    };
+    let auth_result = state
+        .provider
+        .get_mapping_provider()
+        .authenticate_by_mapping(&exec, &mapping_req)
+        .await
+        .map_err(|e| AuthenticationError::Provider {
+            source: Box::new(e),
+            context: Some("external assertion mapping authentication".to_string()),
+        })?;
+
+    let ctx = SecurityContext::try_from(auth_result)?;
+    let vsc = ValidatedSecurityContext::new_for_scope(ctx, scope, state).await?;
+    Ok((vsc, ruleset.ruleset_version))
+}
+
 /// Resolve the mapping-matched [`Authorization`] into a [`ScopeInfo`] backed
 /// by the resource provider's live `Project`/`Domain` records, not by
 /// ruleset-declared placeholders.
@@ -144,7 +215,7 @@ pub async fn hydrate_client_credentials_context(
 /// disabled after the ruleset was written, without the ruleset itself being
 /// updated). Fetching the real record here -- rather than fabricating one
 /// with `enabled: true` hardcoded -- is what makes the subsequent
-/// `ScopeInfo::validate()` call in `hydrate_client_credentials_context`
+/// `ScopeInfo::validate()` call during context hydration
 /// meaningful: without it, `validate()` would only ever be checking its own
 /// placeholder's `true` against itself.
 ///
@@ -164,15 +235,15 @@ async fn scope_info_from_authorization(
             let project = resource_provider
                 .get_project_ref(exec, project_id)
                 .await
-                .auth_context("fetching oauth2 client_credentials scope project")?
+                .auth_context("fetching oauth2 mapping scope project")?
                 .ok_or_else(|| ResourceProviderError::ProjectNotFound(project_id.clone()))
-                .auth_context("fetching oauth2 client_credentials scope project")?;
+                .auth_context("fetching oauth2 mapping scope project")?;
             let project_domain = resource_provider
                 .get_domain_ref(exec, &project.domain_id)
                 .await
-                .auth_context("fetching oauth2 client_credentials scope project domain")?
+                .auth_context("fetching oauth2 mapping scope project domain")?
                 .ok_or_else(|| ResourceProviderError::DomainNotFound(project.domain_id.clone()))
-                .auth_context("fetching oauth2 client_credentials scope project domain")?;
+                .auth_context("fetching oauth2 mapping scope project domain")?;
             Ok(ScopeInfo::Project {
                 project,
                 project_domain,
@@ -182,9 +253,9 @@ async fn scope_info_from_authorization(
             let domain = resource_provider
                 .get_domain_ref(exec, domain_id)
                 .await
-                .auth_context("fetching oauth2 client_credentials scope domain")?
+                .auth_context("fetching oauth2 mapping scope domain")?
                 .ok_or_else(|| ResourceProviderError::DomainNotFound(domain_id.clone()))
-                .auth_context("fetching oauth2 client_credentials scope domain")?;
+                .auth_context("fetching oauth2 mapping scope domain")?;
             Ok(ScopeInfo::Domain(domain))
         }
         Authorization::System { system_id, .. } => Ok(ScopeInfo::System(system_id.clone())),
@@ -279,4 +350,147 @@ pub fn build_access_token_claims(
         },
         cnf: None,
     })
+}
+
+/// Build claims for a token minted from an external assertion.
+///
+/// The returned token never outlives the validated assertion, even when the
+/// configured access-token lifetime is longer.
+#[allow(clippy::too_many_arguments)]
+pub fn build_external_assertion_claims(
+    client: &OAuth2ClientResource,
+    vsc: &ValidatedSecurityContext,
+    issuer: &str,
+    jti: String,
+    ruleset_version: u128,
+    iat: i64,
+    configured_exp: i64,
+    assertion_exp: i64,
+    audience: Audience,
+) -> Result<OpenStackAccessTokenClaims, Oauth2ClientProviderError> {
+    use openstack_keystone_core_types::auth::IdentityInfo;
+
+    let identity = &vsc.inner().principal().identity;
+    let (user_id, user_name, user_domain_id, amr) = match identity {
+        IdentityInfo::User(user) => {
+            let user_name = user
+                .user
+                .as_ref()
+                .map(|record| record.name.clone())
+                .unwrap_or_else(|| user.user_id.clone());
+            (
+                user.user_id.clone(),
+                user_name,
+                user.user_domain.as_ref().map(|domain| domain.id.clone()),
+                vec!["external_jwt".to_string()],
+            )
+        }
+        IdentityInfo::Principal(principal) => (
+            principal.id.clone(),
+            principal
+                .resolved_user_name
+                .clone()
+                .unwrap_or_else(|| principal.id.clone()),
+            principal.domain.as_ref().map(|domain| domain.id.clone()),
+            vec!["external_jwt".to_string()],
+        ),
+    };
+
+    let authz = vsc.inner().authorization().ok_or_else(|| {
+        Oauth2ClientProviderError::Validation(
+            "external assertion mapping has no authorization scope".to_string(),
+        )
+    })?;
+    let scope_domain_id = match &authz.scope {
+        ScopeInfo::Project { project_domain, .. } => project_domain.id.as_str(),
+        ScopeInfo::Domain(domain) => domain.id.as_str(),
+        ScopeInfo::System(_) => &client.domain_id,
+        _ => {
+            return Err(Oauth2ClientProviderError::Validation(
+                "external assertion mapping has an unsupported scope".to_string(),
+            ));
+        }
+    };
+    if scope_domain_id != client.domain_id {
+        return Err(Oauth2ClientProviderError::Validation(
+            "external assertion mapping scope belongs to another domain".to_string(),
+        ));
+    }
+
+    let exp = cap_external_assertion_expiry(configured_exp, assertion_exp, iat)?;
+
+    let role_refs = authz.effective_roles().unwrap_or(&[]).to_vec();
+    let role_names = role_refs
+        .iter()
+        .filter_map(|role| role.name.clone())
+        .collect();
+    let scope = match &authz.scope {
+        ScopeInfo::Project {
+            project,
+            project_domain,
+        } => OpenStackScope::Project {
+            project_id: project.id.clone(),
+            project_domain_id: project_domain.id.clone(),
+            roles: role_refs,
+        },
+        ScopeInfo::Domain(domain) => OpenStackScope::Domain {
+            domain_id: domain.id.clone(),
+            roles: role_refs,
+        },
+        ScopeInfo::System(system_id) => OpenStackScope::System {
+            system_id: system_id.clone(),
+            roles: role_refs,
+        },
+        _ => OpenStackScope::Unscoped,
+    };
+
+    Ok(OpenStackAccessTokenClaims {
+        iss: issuer.to_string(),
+        sub: user_id.clone(),
+        aud: audience,
+        client_id: client.client_id.clone(),
+        exp,
+        iat,
+        nbf: iat,
+        jti,
+        keystone_ruleset_version: ruleset_version,
+        amr,
+        token_use: "access".to_string(),
+        delegation_context: DelegationContext::Plain,
+        act: None,
+        openstack_context: OpenStackContext {
+            user_id,
+            user_name,
+            user_domain_id,
+            scope,
+            roles: role_names,
+        },
+        cnf: None,
+    })
+}
+
+fn cap_external_assertion_expiry(
+    configured_exp: i64,
+    assertion_exp: i64,
+    iat: i64,
+) -> Result<i64, Oauth2ClientProviderError> {
+    let exp = configured_exp.min(assertion_exp);
+    if exp <= iat {
+        return Err(Oauth2ClientProviderError::Validation(
+            "external assertion expires before the access token can be issued".to_string(),
+        ));
+    }
+    Ok(exp)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cap_external_assertion_expiry;
+
+    #[test]
+    fn external_token_expiry_never_exceeds_assertion_expiry() {
+        assert!(cap_external_assertion_expiry(500, 300, 100).is_ok_and(|exp| exp == 300));
+        assert!(cap_external_assertion_expiry(250, 300, 100).is_ok_and(|exp| exp == 250));
+        assert!(cap_external_assertion_expiry(300, 100, 100).is_err());
+    }
 }

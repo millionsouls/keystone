@@ -11,13 +11,13 @@
 // limitations under the License.
 //
 // SPDX-License-Identifier: Apache-2.0
-//! Shared RFC 8693 request rules for native and on-behalf-of exchange.
+//! Shared RFC 8693 request rules for native and external JWT exchange.
 
 use super::{Oauth2TokenError, TokenForm};
 
 pub(super) const ACCESS_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";
 pub(super) const KEYSTONE_TOKEN_TYPE: &str = "urn:openstack:params:oauth:token-type:keystone";
-const JWT_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:jwt";
+pub(super) const JWT_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:jwt";
 const API_SCOPE: &str = "openstack:api";
 
 /// Validate the common exchange envelope after the caller's rate limit.
@@ -31,11 +31,7 @@ pub(super) fn validate_exchange_request(form: &TokenForm) -> Result<String, Oaut
     };
     match subject_type {
         ACCESS_TOKEN_TYPE | KEYSTONE_TOKEN_TYPE => {}
-        JWT_TOKEN_TYPE => {
-            // #1018 extension point: external JWT ingress must use the mapping
-            // engine. For compatibility this arm currently permits only JWTs
-            // accepted by the existing Keystone-native validation backend.
-        }
+        JWT_TOKEN_TYPE => {}
         _ => {
             return Err(Oauth2TokenError::invalid_request(format!(
                 "subject_token_type `{subject_type}` is not supported"
