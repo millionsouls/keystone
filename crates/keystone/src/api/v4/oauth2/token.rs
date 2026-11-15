@@ -30,6 +30,7 @@ mod device_code;
 mod dpop;
 mod error;
 mod exchange_request;
+mod external_assertion;
 mod on_behalf_of;
 mod refresh_token;
 mod service_grant;
@@ -94,10 +95,10 @@ pub(super) struct TokenForm {
     #[serde(default)]
     refresh_token: Option<String>,
     /// RFC 8693 Token Exchange grant only: the existing Keystone-native
-    /// token (Fernet or JWS) being exchanged.
+    /// token (Fernet or JWS) or external assertion JWT being exchanged.
     #[serde(default)]
     subject_token: Option<String>,
-    /// RFC 8693 subject type: access_token, Keystone-native, or native JWT.
+    /// RFC 8693 subject type: access_token, Keystone-native, or JWT.
     #[serde(default)]
     subject_token_type: Option<String>,
     /// RFC 8693 requested output type; only access_token is supported.

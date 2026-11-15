@@ -36,14 +36,12 @@ use crate::api::v4::oauth2::well_known::base_url;
 
 use super::exchange_request::{ACCESS_TOKEN_TYPE, validate_exchange_request};
 
-/// RFC 8693 Token Exchange grant (ADR 0026 §12 "v2 shape", implemented as
-/// the follow-up amendment the ADR itself defers this grant's concrete
-/// shape to). Trades an existing Keystone-native delegated credential
-/// (trust or application credential; EC2 deferred) for a native
-/// `OpenStackAccessTokenClaims`. Gating: the exchanging client must hold
-/// `token-exchange` in its own `grant_types` -- SystemAdmin-only to enable,
-/// mirroring `pre_authorized`'s gating (ADR 0026 §5), enforced at client
-/// create/update time, not here.
+/// RFC 8693 Token Exchange grant (ADR 0026 §12 "v2 shape"). Dispatches
+/// Keystone-native credentials to the native exchange flow and external JWT
+/// assertions to the IdP-backed mapping flow. Gating: the exchanging client
+/// must hold `token-exchange` in its own `grant_types` -- SystemAdmin-only to
+/// enable, mirroring `pre_authorized`'s gating (ADR 0026 §5), enforced at
+/// client create/update time, not here.
 pub(super) async fn handle_token_exchange_grant(
     state: &ServiceState,
     domain_id: &str,
@@ -111,10 +109,34 @@ pub(super) async fn handle_token_exchange_grant(
     )
     .await?;
 
-    let (vsc, delegation_context, credential_expires_at) =
-        openstack_keystone_core::oauth2_client::validate_subject_token(state, &subject_token)
-            .await
-            .map_err(exchange_error)?;
+    // Only a token the native driver cannot decode is eligible for external
+    // verification. A valid native token that fails authorization must not
+    // be retried under a different trust path.
+    let native_subject =
+        openstack_keystone_core::oauth2_client::validate_subject_token(state, &subject_token).await;
+    let (vsc, delegation_context, credential_expires_at) = match native_subject {
+        Ok(subject) => subject,
+        Err(openstack_keystone_core::oauth2_client::TokenExchangeError::InvalidSubjectToken(
+            openstack_keystone_core_types::token::TokenProviderError::InvalidToken { .. },
+        )) if form.subject_token_type.as_deref()
+            == Some(super::exchange_request::JWT_TOKEN_TYPE) =>
+        {
+            return super::external_assertion::handle_external_assertion_exchange(
+                state,
+                domain_id,
+                headers,
+                correlation_id,
+                form,
+                &client,
+                subject_token,
+                confirmation,
+                scope,
+                oauth2_cfg,
+            )
+            .await;
+        }
+        Err(error) => return Err(exchange_error(error)),
+    };
 
     // The Keystone-native tokens this grant accepts carry no confirmation
     // claim. A subject token that does is a sender-constrained token whose
@@ -224,7 +246,7 @@ fn exchange_error(
 /// closed on a token type it cannot honour, so a JWT-shaped token that cannot
 /// be inspected counts as carrying a confirmation rather than as plain.
 /// Tokens that are not JWT-shaped (the opaque Fernet tokens) have no claims.
-fn subject_token_carries_cnf(token: &str) -> bool {
+pub(super) fn subject_token_carries_cnf(token: &str) -> bool {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     let mut parts = token.split('.');
     let (Some(_), Some(payload), Some(_), None) =
@@ -632,7 +654,7 @@ mod tests {
             .with_state(state);
         api.as_service()
             .oneshot(request(&format!(
-                "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange&client_id=client-1&client_secret=s3cr3t&subject_token=some-existing-token&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Ajwt{extra}"
+                "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange&client_id=client-1&client_secret=s3cr3t&subject_token=some-existing-token&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token{extra}"
             )))
             .await
             .unwrap()
@@ -782,7 +804,7 @@ mod tests {
             .await;
             let mut api = openapi_router().with_state(state);
             let response = api.as_service().oneshot(request(
-                "grant_type=urn:ietf:params:oauth:grant-type:token-exchange&client_id=client-1&client_secret=s3cr3t&subject_token=subject&subject_token_type=urn:ietf:params:oauth:token-type:access_token"
+                "grant_type=urn:ietf:params:oauth:grant-type:token-exchange&client_id=client-1&client_secret=s3cr3t&subject_token=subject&subject_token_type=urn:ietf:params:oauth:token-type:jwt"
             )).await.unwrap();
             assert_eq!(response.status(), status, "{kind}");
             let body = json_body(response).await;

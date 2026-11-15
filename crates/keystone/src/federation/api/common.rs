@@ -52,7 +52,7 @@ const CLAIMS_MAP_LIMIT: usize = 64 * 1024;
 /// # Returns
 /// Flattened claims map, or `MappingProviderError::ClaimsMapTooLarge` if
 /// the total map exceeds 64 KiB.
-pub(super) fn flatten_federation_claims(
+pub(crate) fn flatten_federation_claims(
     claims_json: &Value,
 ) -> Result<HashMap<String, Vec<String>>, MappingProviderError> {
     let mut claims = HashMap::new();

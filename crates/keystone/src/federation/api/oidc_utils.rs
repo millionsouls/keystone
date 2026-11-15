@@ -31,7 +31,7 @@ use super::error::OidcError;
 
 /// Subset of the OIDC Provider Metadata we actually use.
 #[derive(Debug, Deserialize)]
-pub(super) struct OidcProviderMetadata {
+pub(crate) struct OidcProviderMetadata {
     pub issuer: String,
     pub authorization_endpoint: String,
     pub token_endpoint: String,
@@ -46,7 +46,7 @@ pub(super) struct OidcProviderMetadata {
 ///
 /// Validates per RFC 8414 §3 that the returned `issuer` matches the URL used
 /// for discovery.
-pub(super) async fn discover(
+pub(crate) async fn discover(
     issuer_url: &str,
     client: &reqwest::Client,
 ) -> Result<OidcProviderMetadata, OidcError> {
@@ -186,7 +186,7 @@ pub(super) async fn exchange_code(
 }
 
 /// Fetch a JWKS from the given URI.
-pub(super) async fn fetch_jwks(
+pub(crate) async fn fetch_jwks(
     jwks_uri: &str,
     client: &reqwest::Client,
 ) -> Result<JwkSet, OidcError> {
@@ -335,7 +335,7 @@ fn check_nonce(
 
 /// Build a `reqwest::Client` with redirect following disabled (SSRF guard)
 /// and a reasonable default timeout to prevent resource exhaustion.
-pub(super) fn build_http_client() -> Result<reqwest::Client, OidcError> {
+pub(crate) fn build_http_client() -> Result<reqwest::Client, OidcError> {
     openstack_keystone_tls_provider::install_default();
     reqwest::ClientBuilder::new()
         .redirect(reqwest::redirect::Policy::none())

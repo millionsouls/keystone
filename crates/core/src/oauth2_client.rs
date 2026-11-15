@@ -17,6 +17,7 @@
 //! validation only in Phase 2 -- wiring into the mapping engine's
 //! `IdentitySource` for actual `/token` issuance is Phase 3/4.
 
+pub mod assertion_replay;
 pub mod backend;
 pub mod bound_bearer;
 pub mod crypto;
@@ -32,6 +33,7 @@ pub mod id_token;
 pub mod on_behalf_of;
 pub mod pkce;
 mod provider_api;
+pub mod replay;
 pub mod service;
 pub mod token;
 pub mod token_exchange;
@@ -44,7 +46,10 @@ pub use hook::Oauth2ClientHook;
 pub use id_token::{IdTokenClaimsError, IdTokenParams, TemplateScope, build_id_token_claims};
 pub use provider_api::Oauth2ClientApi;
 pub use service::Oauth2ClientService;
-pub use token::{build_access_token_claims, hydrate_client_credentials_context};
+pub use token::{
+    build_access_token_claims, build_external_assertion_claims, hydrate_client_credentials_context,
+    hydrate_external_assertion_context, prepare_external_assertion_mapping,
+};
 pub use token_exchange::{TokenExchangeError, build_token_exchange_claims, validate_subject_token};
 pub use verify::{
     IntrospectedAccessToken, RevocableAccessToken, SubjectTokenValidationProfile,
