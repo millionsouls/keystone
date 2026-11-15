@@ -95,6 +95,7 @@ impl IdentityBackend for SqlBackend {
     /// - `user_id`: The ID of the user.
     /// - `group_id`: The ID of the group.
     /// - `idp_id`: The ID of the identity provider.
+    /// - `last_verified`: Optional last verification time; defaults to now.
     ///
     /// # Returns
     /// A `Result` containing `()` if successful, or an `Error`.
@@ -105,13 +106,14 @@ impl IdentityBackend for SqlBackend {
         user_id: &'a str,
         group_id: &'a str,
         idp_id: &'a str,
+        last_verified: Option<&'a DateTime<Utc>>,
     ) -> Result<(), IdentityProviderError> {
         Ok(user_group::add_user_to_group_expiring(
             &state.db.connection(),
             user_id,
             group_id,
             idp_id,
-            None,
+            last_verified,
         )
         .await?)
     }
@@ -143,6 +145,7 @@ impl IdentityBackend for SqlBackend {
     /// - `state`: The service state.
     /// - `memberships`: A list of user and group ID pairs.
     /// - `idp_id`: The ID of the identity provider.
+    /// - `last_verified`: Optional last verification time; defaults to now.
     ///
     /// # Returns
     /// A `Result` containing `()` if successful, or an `Error`.
@@ -152,12 +155,13 @@ impl IdentityBackend for SqlBackend {
         state: &ServiceState,
         memberships: Vec<(&'a str, &'a str)>,
         idp_id: &'a str,
+        last_verified: Option<&'a DateTime<Utc>>,
     ) -> Result<(), IdentityProviderError> {
         Ok(user_group::add_users_to_groups_expiring(
             &state.db.connection(),
             memberships,
             idp_id,
-            None,
+            last_verified,
         )
         .await?)
     }
@@ -344,6 +348,21 @@ impl IdentityBackend for SqlBackend {
     ) -> Result<Option<UserResponse>, IdentityProviderError> {
         let config = state.config_manager.config.read().await;
         Ok(user::get(&config, &state.db.connection(), user_id).await?)
+    }
+
+    /// Get the minimal user data required to authorize a request.
+    ///
+    /// # Parameters
+    /// - `state`: The service state.
+    /// - `user_id`: The ID of the user to retrieve.
+    #[tracing::instrument(name = "driver.sql.identity.get_user_core", level = "debug", skip_all, fields(user_id = %user_id))]
+    async fn get_user_core<'a>(
+        &self,
+        state: &ServiceState,
+        user_id: &'a str,
+    ) -> Result<Option<UserCore>, IdentityProviderError> {
+        let config = state.config_manager.config.read().await;
+        Ok(user::get_core(&config, &state.db.connection(), user_id).await?)
     }
 
     /// Get single user by ID.

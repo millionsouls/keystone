@@ -132,6 +132,10 @@ pub(super) async fn handle_token_exchange_grant(
     let issuer = format!("{base}/v4/oauth2/{domain_id}");
     let now = chrono::Utc::now().timestamp();
     let access_lifetime = i64::from(oauth2_cfg.access_token_lifetime_minutes) * 60;
+    if access_lifetime <= 0 {
+        tracing::error!("oauth2 access_token_lifetime_minutes must be greater than zero");
+        return Err(Oauth2TokenError::internal("token issuance failed"));
+    }
     let jti = uuid::Uuid::new_v4().to_string();
 
     let mut claims = openstack_keystone_core::oauth2_client::build_token_exchange_claims(
@@ -172,8 +176,9 @@ pub(super) async fn handle_token_exchange_grant(
     Ok((StatusCode::OK, Json(response)).into_response())
 }
 
-/// RFC 8693 §2.2.2: invalid subjects use invalid_request; provider failures
-/// are server errors rather than evidence of invalid credentials.
+/// RFC 8693 §2.2.2: a request whose subject_token is invalid for any reason
+/// (expired, revoked, not delegated, outside policy) is `invalid_request`.
+/// Provider failures are server errors, not evidence of a bad credential.
 fn exchange_error(
     error: openstack_keystone_core::oauth2_client::TokenExchangeError,
 ) -> Oauth2TokenError {
@@ -199,9 +204,6 @@ fn exchange_error(
         TokenExchangeError::CrossDomainSubjectToken => Oauth2TokenError::invalid_request(
             "subject_token's scope belongs to a different domain than this token endpoint",
         ),
-        TokenExchangeError::MissingSubjectTokenExpiry => Oauth2TokenError::invalid_request(
-            "subject_token is missing an expiry claim, cannot be exchanged",
-        ),
         TokenExchangeError::CredentialChainExpired => Oauth2TokenError::invalid_request(
             "subject_token or application credential expiry does not permit token exchange",
         ),
@@ -216,7 +218,6 @@ fn exchange_error(
         _ => Oauth2TokenError::internal("token issuance failed"),
     }
 }
-
 /// Whether `token` is a JWT whose payload has a `cnf` claim, or one whose
 /// payload cannot be read. The payload is read without verifying anything:
 /// the caller has already validated the token and only uses this to fail
@@ -363,7 +364,7 @@ mod tests {
 
     fn trust_delegated_vsc() -> openstack_keystone_core::auth::ValidatedSecurityContext {
         use openstack_keystone_core_types::identity::UserResponseBuilder;
-        use openstack_keystone_core_types::resource::{Domain, Project};
+        use openstack_keystone_core_types::resource::{Domain, ProjectRef};
         use openstack_keystone_core_types::trust::Trust;
 
         let user = UserResponseBuilder::default()
@@ -380,14 +381,14 @@ mod tests {
                 name: Some("member".to_string()),
             }])
             .scope(ScopeInfo::Project {
-                project: Project {
+                project: ProjectRef {
                     id: "project-1".to_string(),
                     domain_id: "domain-1".to_string(),
                     enabled: true,
                     name: "project".to_string(),
                     ..Default::default()
                 },
-                project_domain: Domain {
+                project_domain: openstack_keystone_core_types::resource::DomainRef {
                     id: "domain-1".to_string(),
                     name: "domain".to_string(),
                     enabled: true,
@@ -433,7 +434,7 @@ mod tests {
         app_cred_expires_at: chrono::DateTime<chrono::Utc>,
     ) -> openstack_keystone_core::auth::ValidatedSecurityContext {
         use openstack_keystone_core_types::identity::UserResponseBuilder;
-        use openstack_keystone_core_types::resource::{Domain, Project};
+        use openstack_keystone_core_types::resource::{Domain, ProjectRef};
 
         let user = UserResponseBuilder::default()
             .id("user-1")
@@ -449,14 +450,14 @@ mod tests {
                 name: Some("member".to_string()),
             }])
             .scope(ScopeInfo::Project {
-                project: Project {
+                project: ProjectRef {
                     id: "project-1".to_string(),
                     domain_id: "domain-1".to_string(),
                     enabled: true,
                     name: "project".to_string(),
                     ..Default::default()
                 },
-                project_domain: Domain {
+                project_domain: openstack_keystone_core_types::resource::DomainRef {
                     id: "domain-1".to_string(),
                     name: "domain".to_string(),
                     enabled: true,
@@ -1340,5 +1341,24 @@ mod tests {
         assert!(subject_token_carries_cnf("h.!!!.s"));
         assert!(subject_token_carries_cnf(&jwt("not json")));
         assert!(subject_token_carries_cnf(&jwt("[1]")));
+    }
+
+    #[tokio::test]
+    async fn test_exchange_error_variants() {
+        use openstack_keystone_core::oauth2_client::TokenExchangeError;
+
+        let client_side = [
+            TokenExchangeError::NotAUserPrincipal,
+            TokenExchangeError::NoAuthorization,
+            TokenExchangeError::NoDelegationProject,
+            TokenExchangeError::CrossDomainSubjectToken,
+            TokenExchangeError::UnsupportedDelegation("ec2"),
+        ];
+        for error in client_side {
+            let label = format!("{error:?}");
+            let mapped = super::exchange_error(error);
+            assert_eq!(mapped.status(), StatusCode::BAD_REQUEST, "{label}");
+            assert_eq!(mapped.error_code(), "invalid_request", "{label}");
+        }
     }
 }

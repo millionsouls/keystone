@@ -38,7 +38,7 @@ use openstack_keystone_core_types::application_credential::*;
 use openstack_keystone_core_types::oauth2_client::{
     Audience, GrantType, OAuth2ClientResourceCreateBuilder,
 };
-use openstack_keystone_core_types::resource::{DomainBuilder, ProjectBuilder};
+use openstack_keystone_core_types::resource::{DomainRefBuilder, ProjectRefBuilder};
 use openstack_keystone_core_types::role::*;
 
 use crate::assignment::grant_role_to_user_on_project;
@@ -103,6 +103,10 @@ async fn mint_app_cred_subject_token(
         openstack_keystone_core_types::resource::Project,
         openstack_keystone::keystone::ServiceState,
     >,
+    crate::common::AsyncResourceGuard<
+        openstack_keystone_core_types::role::Role,
+        openstack_keystone::keystone::ServiceState,
+    >,
 )> {
     let project = create_project!(state, domain_id.to_string())?;
     let user = create_user!(state, domain_id.to_string())?;
@@ -149,13 +153,13 @@ async fn mint_app_cred_subject_token(
             &ExecutionContext::internal(state),
             &ctx,
             &ScopeInfo::Project {
-                project: ProjectBuilder::default()
+                project: ProjectRefBuilder::default()
                     .id(cred.project_id.clone())
                     .name(project.id.clone())
                     .domain_id(domain_id.to_string())
                     .enabled(true)
                     .build()?,
-                project_domain: DomainBuilder::default()
+                project_domain: DomainRefBuilder::default()
                     .id(domain_id.to_string())
                     .name(domain_id.to_string())
                     .enabled(true)
@@ -168,7 +172,9 @@ async fn mint_app_cred_subject_token(
         .provider
         .get_token_provider()
         .encode_token(vsc.inner().token().unwrap())?;
-    Ok((encoded, user, project))
+    // The role guard goes back to the caller: deleting the role revokes
+    // its assignments, which must not happen before the token is used.
+    Ok((encoded, user, project, role))
 }
 
 #[tokio::test]
@@ -178,11 +184,24 @@ async fn test_token_exchange_full_flow_issues_app_cred_delegated_claims() -> Res
     let domain = create_domain!(state)?;
     let client = provision_token_exchange_client(&state, &domain.id).await?;
     let app_cred_expires_at = chrono::Utc::now() + chrono::Duration::hours(1);
-    let (subject_token, _user_guard, _project_guard) =
+    let (subject_token, _user_guard, _project_guard, _role_guard) =
         mint_app_cred_subject_token(&state, &domain.id, app_cred_expires_at).await?;
 
     let (vsc, delegation, credential_expiration) =
         validate_subject_token(&state, &subject_token).await?;
+    let iat = chrono::Utc::now().timestamp();
+    let default_exp = iat + 900;
+    assert!(
+        vsc.inner()
+            .expires_at()
+            .is_some_and(|subject_exp| subject_exp.timestamp() > default_exp),
+        "validated subject token must outlive the configured default"
+    );
+    assert!(
+        credential_expiration
+            .is_some_and(|credential_exp| credential_exp.timestamp() > default_exp),
+        "application credential must outlive the configured default"
+    );
     let issuer = format!("https://ks.example/v4/oauth2/{}", domain.id);
     let claims = build_token_exchange_claims(
         &client,
@@ -191,12 +210,14 @@ async fn test_token_exchange_full_flow_issues_app_cred_delegated_claims() -> Res
         credential_expiration,
         &issuer,
         Uuid::new_v4().to_string(),
-        chrono::Utc::now().timestamp(),
-        chrono::Utc::now().timestamp() + 900,
+        iat,
+        default_exp,
         Audience::control_plane(),
     )?;
 
     assert_eq!(claims.aud, Audience::control_plane());
+    assert_eq!(claims.iat, iat);
+    assert_eq!(claims.exp, default_exp);
     assert!(claims.amr.contains(&"application_credential".to_string()));
 
     Ok(())
@@ -209,7 +230,7 @@ async fn test_token_exchange_caps_expiry_at_short_lived_app_credential() -> Resu
     let domain = create_domain!(state)?;
     let client = provision_token_exchange_client(&state, &domain.id).await?;
     let app_cred_expires_at = chrono::Utc::now() + chrono::Duration::minutes(5);
-    let (subject_token, _user_guard, _project_guard) =
+    let (subject_token, _user_guard, _project_guard, _role_guard) =
         mint_app_cred_subject_token(&state, &domain.id, app_cred_expires_at).await?;
 
     let (vsc, delegation, credential_expiration) =
@@ -223,8 +244,8 @@ async fn test_token_exchange_caps_expiry_at_short_lived_app_credential() -> Resu
         credential_expiration,
         &issuer,
         Uuid::new_v4().to_string(),
-        chrono::Utc::now().timestamp(),
-        chrono::Utc::now().timestamp() + 900,
+        now,
+        now + 900,
         Audience::control_plane(),
     )?;
 
@@ -246,7 +267,7 @@ async fn test_token_exchange_rejects_cross_domain_subject_token() -> Result<()> 
     let domain_b = create_domain!(state)?;
     let client_b = provision_token_exchange_client(&state, &domain_b.id).await?;
     let app_cred_expires_at = chrono::Utc::now() + chrono::Duration::hours(1);
-    let (subject_token_a, _user_guard, _project_guard) =
+    let (subject_token_a, _user_guard, _project_guard, _role_guard) =
         mint_app_cred_subject_token(&state, &domain_a.id, app_cred_expires_at).await?;
 
     let (vsc, delegation, credential_expiration) =

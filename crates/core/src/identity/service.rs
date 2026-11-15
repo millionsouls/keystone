@@ -16,6 +16,7 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use futures_util::{StreamExt, TryStreamExt};
 use secrecy::SecretString;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -24,12 +25,14 @@ use uuid::Uuid;
 use validator::Validate;
 
 use openstack_keystone_config::Config;
+use openstack_keystone_core_types::assignment::RoleAssignmentListParameters;
 use openstack_keystone_core_types::domain_config::DomainConfigGroupName;
 use openstack_keystone_core_types::events::{
     Event, EventPayload, MFA_ENABLED_OPERATION, Operation, PASSWORD_CHANGE_OPERATION,
 };
 use openstack_keystone_core_types::identity::*;
 use openstack_keystone_core_types::idmapping::IdMappingEntityType;
+use openstack_keystone_core_types::revoke::RevocationEventCreate;
 
 use crate::auth::{
     AuthenticationContext, AuthenticationError, AuthenticationResult, AuthenticationResultBuilder,
@@ -44,8 +47,14 @@ use crate::plugin_manager::PluginManagerApi;
 use crate::request_cache::{cache_get, cache_remove, cache_set};
 use crate::resource::error::ResourceProviderError;
 
+/// How many member revocation events a group deletion writes at once.
+const REVOKE_CONCURRENCY: usize = 16;
+
 /// Request-cache namespace for [`UserResponse`] lookups by `user_id`.
 const USER_CACHE_NS: &str = "identity.user";
+/// Request-cache namespace of the minimal user data. Kept apart from
+/// [`USER_CACHE_NS`] so partial data can never be served as a full user.
+const USER_CORE_CACHE_NS: &str = "identity.user_core";
 /// Request-cache namespace for [`Group`] lookups by `group_id`.
 const GROUP_CACHE_NS: &str = "identity.group";
 
@@ -380,6 +389,99 @@ impl IdentityService {
         Ok(())
     }
 
+    /// Collect the public IDs of the group members whose tokens must be
+    /// revoked when the group is deleted.
+    ///
+    /// Mirrors python-keystone: a group without role assignments does not
+    /// affect the effective roles of its members, so their tokens stay valid
+    /// and nothing is collected. A group that is already gone (retry of a
+    /// half-finished deletion) has no members left, which is not an error.
+    ///
+    /// Members of a non-default backend are known to the API under their
+    /// mapped public id. A member without a mapping has never been exposed
+    /// and cannot hold a token, so it is skipped rather than given a new
+    /// mapping.
+    async fn group_members_to_revoke(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        backend: &Arc<dyn IdentityBackend>,
+        group_id: &str,
+        local_group_id: &str,
+    ) -> Result<Vec<String>, IdentityProviderError> {
+        let has_assignments = !ctx
+            .state()
+            .provider
+            .get_assignment_provider()
+            .list_role_assignments(
+                ctx,
+                &RoleAssignmentListParameters {
+                    group_id: Some(group_id.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await?
+            .is_empty();
+        if !has_assignments {
+            return Ok(Vec::new());
+        }
+        let local_ids = backend
+            .list_users_of_group(ctx.state(), local_group_id)
+            .await?;
+        if local_ids.is_empty() || Arc::ptr_eq(backend, &self.backend_driver) {
+            return Ok(local_ids);
+        }
+        // Users live in the domain of their group.
+        let Some(group) = backend.get_group(ctx.state(), local_group_id).await? else {
+            return Ok(Vec::new());
+        };
+        let short_ctx = ExecutionContext::internal(ctx.state());
+        let idmapping = ctx.state().provider.get_idmapping_provider();
+        let mut public_ids = Vec::with_capacity(local_ids.len());
+        for local_id in &local_ids {
+            if let Some(mapping) = idmapping
+                .get_by_local_id(
+                    &short_ctx,
+                    local_id,
+                    &group.domain_id,
+                    IdMappingEntityType::User,
+                )
+                .await?
+            {
+                public_ids.push(mapping.public_id);
+            }
+        }
+        Ok(public_ids)
+    }
+
+    /// Create a revocation event for every user, invalidating their tokens
+    /// (python-keystone emits the same on group deletion since the effective
+    /// roles of the members change).
+    ///
+    /// The events are written concurrently, up to [`REVOKE_CONCURRENCY`] at a
+    /// time.
+    async fn revoke_tokens_of_users(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        user_ids: Vec<String>,
+    ) -> Result<(), IdentityProviderError> {
+        let revoke = ctx.state().provider.get_revoke_provider();
+        let now = Utc::now();
+        futures_util::stream::iter(user_ids)
+            .map(Ok::<_, IdentityProviderError>)
+            .try_for_each_concurrent(REVOKE_CONCURRENCY, |user_id| {
+                let revoke = &revoke;
+                async move {
+                    revoke
+                        .create_revocation_event(ctx, RevocationEventCreate::for_user(user_id, now))
+                        .await?;
+                    // ADR 0031 "Tokens": group deletion cascades revocation.
+                    crate::token::TOKEN_METRICS.record_revoked("cascade");
+                    Ok(())
+                }
+            })
+            .await
+    }
+
     /// Turn a backend-native local id into the public id API consumers see.
     ///
     /// A no-op (returns `local_id` unchanged) when `backend` is the global
@@ -586,6 +688,7 @@ impl IdentityApi for IdentityService {
         user_id: &'a str,
         group_id: &'a str,
         idp_id: &'a str,
+        last_verified: Option<&'a DateTime<Utc>>,
     ) -> Result<(), IdentityProviderError> {
         let backend_driver = self.membership_backend(ctx, user_id, group_id).await?;
         if let Some(vsc) = ctx.ctx() {
@@ -601,14 +704,14 @@ impl IdentityApi for IdentityService {
                 ),
                 operation: async {
                     backend_driver
-                        .add_user_to_group_expiring(ctx.state(), user_id, group_id, idp_id)
+                        .add_user_to_group_expiring(ctx.state(), user_id, group_id, idp_id, last_verified)
                         .await
                 },
                 on_audit_error: |_: AuditDispatchError| IdentityProviderError::Driver("audit dispatch failed".into()),
             }?;
         } else {
             backend_driver
-                .add_user_to_group_expiring(ctx.state(), user_id, group_id, idp_id)
+                .add_user_to_group_expiring(ctx.state(), user_id, group_id, idp_id, last_verified)
                 .await?;
             ctx.state()
                 .event_dispatcher
@@ -709,6 +812,7 @@ impl IdentityApi for IdentityService {
         ctx: &ExecutionContext<'a>,
         memberships: Vec<(&'a str, &'a str)>,
         idp_id: &'a str,
+        last_verified: Option<&'a DateTime<Utc>>,
     ) -> Result<(), IdentityProviderError> {
         let (first_user_id, group_ids): (String, Vec<String>) = if memberships.is_empty() {
             (String::new(), Vec::new())
@@ -747,6 +851,7 @@ impl IdentityApi for IdentityService {
                                 .map(|(u, g)| (u.as_str(), g.as_str()))
                                 .collect(),
                             &idp_id,
+                            last_verified,
                         )
                         .await
                 },
@@ -754,7 +859,7 @@ impl IdentityApi for IdentityService {
             }?;
         } else {
             backend_driver
-                .add_users_to_groups_expiring(ctx.state(), memberships, idp_id)
+                .add_users_to_groups_expiring(ctx.state(), memberships, idp_id, last_verified)
                 .await?;
             ctx.state()
                 .event_dispatcher
@@ -1093,58 +1198,53 @@ impl IdentityApi for IdentityService {
         group_id: &'a str,
     ) -> Result<(), IdentityProviderError> {
         let (backend_driver, local_id) = self.resolve_public_id(ctx, group_id).await?;
-        if let Some(vsc) = ctx.ctx() {
-            crate::audited_notify_op! {
-                dispatcher: &ctx.state().event_dispatcher,
-                ctx: vsc,
-                event: Event::new(
-                    Operation::Delete,
-                    EventPayload::Group { id: group_id.to_string() },
-                ),
-                operation: async {
-                    // See `delete_user`: finish the cascade of a group that
-                    // an earlier attempt already deleted.
-                    let deleted = match backend_driver.delete_group(ctx.state(), &local_id).await {
-                        Ok(()) => Ok(()),
-                        Err(err @ IdentityProviderError::GroupNotFound(_)) => Err(err),
-                        Err(err) => return Err(err),
-                    };
-                    ctx.state()
-                        .provider
-                        .get_assignment_provider()
-                        .delete_assignments_for_group(ctx, group_id)
-                        .await?;
-                    deleted
-                },
-                on_audit_error: |_: AuditDispatchError| IdentityProviderError::Driver("audit dispatch failed".into()),
-            }?;
-        } else {
-            let deleted = match backend_driver.delete_group(ctx.state(), &local_id).await {
-                Ok(()) => Ok(()),
-                Err(err @ IdentityProviderError::GroupNotFound(_)) => Err(err),
-                Err(err) => return Err(err),
-            };
-            ctx.state()
-                .provider
-                .get_assignment_provider()
-                .delete_assignments_for_group(ctx, group_id)
-                .await?;
-            deleted?;
-            ctx.state()
-                .event_dispatcher
-                .emit(Event::new(
-                    Operation::Delete,
-                    EventPayload::Group {
-                        id: group_id.to_string(),
-                    },
-                ))
-                .await;
-        }
+        let result = crate::audited_if_ctx! {
+            ctx: ctx,
+            event: Event::new(
+                Operation::Delete,
+                EventPayload::Group { id: group_id.to_string() },
+            ),
+            operation: async {
+                // Nothing below may run for a backend that cannot delete.
+                if backend_driver.is_read_only() {
+                    return Err(IdentityProviderError::Readonly(
+                        "identity backend is read-only: delete_group is not permitted".into(),
+                    ));
+                }
+                // The members are only known while the group exists, and a
+                // retry can no longer recover them once it is gone, so their
+                // tokens are revoked before the group is deleted. Revoking
+                // for a delete that then fails is harmless.
+                let members = self
+                    .group_members_to_revoke(ctx, &backend_driver, group_id, &local_id)
+                    .await?;
+                self.revoke_tokens_of_users(ctx, members).await?;
+                // See `delete_user`: finish the cascade of a group that an
+                // earlier attempt already deleted.
+                let deleted = match backend_driver.delete_group(ctx.state(), &local_id).await {
+                    Ok(()) => Ok(()),
+                    Err(err @ IdentityProviderError::GroupNotFound(_)) => Err(err),
+                    Err(err) => return Err(err),
+                };
+                ctx.state()
+                    .provider
+                    .get_assignment_provider()
+                    .delete_assignments_for_group(ctx, group_id)
+                    .await?;
+                deleted
+            },
+            on_audit_error: |_: AuditDispatchError| IdentityProviderError::Driver("audit dispatch failed".into()),
+        };
 
+        // The group row may be gone even when a cascade step failed: drop the
+        // cached entry before the result is returned.
+        cache_remove(GROUP_CACHE_NS, group_id);
+        result?;
+        // The id mapping stays until the delete succeeded: a retry needs it to
+        // find the backend of the group.
         if !Arc::ptr_eq(&backend_driver, &self.backend_driver) {
             self.forget_id_mapping(ctx, group_id).await?;
         }
-        cache_remove(GROUP_CACHE_NS, group_id);
         Ok(())
     }
 
@@ -1160,7 +1260,7 @@ impl IdentityApi for IdentityService {
         user_id: &'a str,
     ) -> Result<(), IdentityProviderError> {
         let (backend_driver, local_id) = self.resolve_public_id(ctx, user_id).await?;
-        crate::audited_if_ctx! {
+        let result = crate::audited_if_ctx! {
             ctx: ctx,
             event: Event::new(
                 Operation::Delete,
@@ -1205,12 +1305,18 @@ impl IdentityApi for IdentityService {
                 deleted
             },
             on_audit_error: |_: AuditDispatchError| IdentityProviderError::Driver("audit dispatch failed".into()),
-        }?;
+        };
 
+        // The user row may be gone even when a cascade step failed: drop the
+        // cached entries before the result is returned.
+        cache_remove(USER_CACHE_NS, user_id);
+        cache_remove(USER_CORE_CACHE_NS, user_id);
+        result?;
+        // The id mapping stays until the delete succeeded: a retry needs it to
+        // find the backend of the user.
         if !Arc::ptr_eq(&backend_driver, &self.backend_driver) {
             self.forget_id_mapping(ctx, user_id).await?;
         }
-        cache_remove(USER_CACHE_NS, user_id);
         Ok(())
     }
 
@@ -1252,6 +1358,36 @@ impl IdentityApi for IdentityService {
             cache_set(USER_CACHE_NS, user_id, user.clone());
         }
         Ok(user)
+    }
+
+    /// Get the minimal user data required to authorize a request.
+    ///
+    /// Serves a full user already loaded in this request when there is one,
+    /// otherwise asks the driver for the minimal record. The result is cached
+    /// in its own request-cache namespace, never in the full user one.
+    #[tracing::instrument(name = "provider.identity.get_user_core", level = "debug", skip_all, fields(user_id = %user_id))]
+    async fn get_user_core<'a>(
+        &self,
+        ctx: &ExecutionContext<'a>,
+        user_id: &'a str,
+    ) -> Result<Option<UserCore>, IdentityProviderError> {
+        if let Some(user) = cache_get::<UserResponse>(USER_CACHE_NS, user_id) {
+            return Ok(Some(UserCore::from(&user)));
+        }
+        if let Some(core) = cache_get::<UserCore>(USER_CORE_CACHE_NS, user_id) {
+            return Ok(Some(core));
+        }
+        let (backend, local_id) = self.resolve_public_id(ctx, user_id).await?;
+        let mut core = backend.get_user_core(ctx.state(), &local_id).await?;
+        if !Arc::ptr_eq(&backend, &self.backend_driver)
+            && let Some(core) = &mut core
+        {
+            core.id = user_id.to_string();
+        }
+        if let Some(core) = &core {
+            cache_set(USER_CORE_CACHE_NS, user_id, core.clone());
+        }
+        Ok(core)
     }
 
     /// Get `domain_id` of a user.
@@ -1902,6 +2038,7 @@ impl IdentityApi for IdentityService {
                 .await;
         }
         cache_set(USER_CACHE_NS, user_id, user.clone());
+        cache_remove(USER_CORE_CACHE_NS, user_id);
         Ok(user)
     }
 
@@ -1937,6 +2074,7 @@ impl IdentityApi for IdentityService {
             on_audit_error: |_: AuditDispatchError| IdentityProviderError::Driver("audit dispatch failed".into()),
         }?;
         cache_remove(USER_CACHE_NS, user_id);
+        cache_remove(USER_CORE_CACHE_NS, user_id);
         Ok(())
     }
 

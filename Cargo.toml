@@ -22,6 +22,7 @@ members = [
   "crates/idmapping-driver-sql",
   "crates/k8s-auth-driver-raft",
   "crates/k8s-auth-driver-sql",
+  "crates/jwt-crypto",
   "crates/key-repository",
   "crates/keystone",
   "crates/limit-driver-sql",
@@ -32,6 +33,7 @@ members = [
   "crates/oauth2-session-driver-raft",
   "crates/oslo-config",
   "crates/password-hashing",
+  "crates/policy-regorus",
   "crates/policy-store-driver-sql",
   "crates/resource-driver-sql",
   "crates/role-driver-sql",
@@ -92,7 +94,7 @@ axum-extra = { version = "0.12", default-features = false }
 axum-server = { version = "0.8", default-features = false }
 crc32fast = { version = "1.5" }
 base64 = { version = "0.23" }
-base64urlsafedata = "0.5"
+base64urlsafedata = "0.6"
 bcrypt = { version = "0.19" }
 byteorder = { version = "1.5" }
 bytes = { version = "1.12" }
@@ -123,7 +125,7 @@ hmac = { version = "0.13" }
 inventory = { version = "0.3" }
 ipnet = { version = "2" }
 itertools = { version = "0.15" }
-jsonwebtoken = { version = "11.1", features = ["rust_crypto"] }
+jsonwebtoken = { version = "11.1", default-features = false, features = ["use_pem"] }
 log = { version = "0.4" }
 ldap3 = { version = "0.12", default-features = false }
 minijinja = { version = "3", features = ["serde"] }
@@ -164,6 +166,7 @@ openstack-keystone-federation-driver-sql = { version = "0.1", path = "crates/fed
 openstack-keystone-k8s-auth-driver-sql = { version = "0.1", path = "crates/k8s-auth-driver-sql/" }
 openstack-keystone-limit-driver-sql = { version = "0.1", path = "crates/limit-driver-sql/" }
 openstack-keystone-k8s-auth-driver-raft = { version = "0.1", path = "crates/k8s-auth-driver-raft/" }
+openstack-keystone-jwt-crypto = { version = "0.1.0", path = "crates/jwt-crypto" }
 openstack-keystone-key-repository = { version = "0.1.0", path = "crates/key-repository" }
 openstack-keystone-local-emergency-store = { version = "0.1.0", path = "crates/local-emergency-store" }
 openstack-keystone-mapping-driver-raft = { version = "0.1", path = "crates/mapping-driver-raft/" }
@@ -175,6 +178,7 @@ openstack-keystone-identity-driver-ldap = { version = "0.1", path = "crates/iden
 openstack-keystone-identity-driver-sql = { version = "0.1", path = "crates/identity-driver-sql" }
 openstack-keystone-idmapping-driver-sql = { version = "0.1", path = "crates/idmapping-driver-sql/" }
 openstack-keystone-policy-store-driver-sql = { version = "0.1", path = "crates/policy-store-driver-sql/" }
+openstack-keystone-policy-regorus = { version = "0.1", path = "crates/policy-regorus/" }
 openstack-keystone-resource-driver-sql = { version = "0.1", path = "crates/resource-driver-sql/" }
 openstack-keystone-revoke-driver-sql = { version = "0.1", path = "crates/revoke-driver-sql/" }
 openstack-keystone-role-driver-sql = { version = "0.1", path = "crates/role-driver-sql/" }
@@ -192,6 +196,7 @@ prost = { version = "0.14" }
 proptest = { version = "1" }
 rand = { version = "0.10" }
 regex = { version = "1.13" }
+regorus = { version = "=0.14.1", default-features = false, features = ["arc", "std", "rvm"] }
 regex-syntax = "0.8"
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "charset", "http2", "system-proxy"] }
 reserve-port = "2.5"
@@ -217,11 +222,11 @@ serde = { version = "1.0" }
 serde_bytes = { version = "0.11" }
 serde_json = { version = "1.0" }
 serde_urlencoded = { version = "0.7" }
-spiffe = { version = "0.18" }
+spiffe = { version = "0.19" }
 # spiffe-rustls hardwires exactly one provider through its own features, so it
 # cannot follow `openstack-keystone-tls-provider`; SPIFFE mTLS stays on ring.
-spiffe-rustls = { version = "0.10", default-features = false, features = ["ring"] }
-spiffe-rustls-tokio = { version = "0.6" }
+spiffe-rustls = { version = "0.11", default-features = false, features = ["ring"] }
+spiffe-rustls-tokio = { version = "0.7" }
 subtle = "2.6"
 temp-env = { version = "0.3" }
 tempfile = { version = "3.27" }

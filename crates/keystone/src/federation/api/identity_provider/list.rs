@@ -82,7 +82,8 @@ pub(super) async fn list(
             // user_auth.principal().domain_id.clone();
             let domain_ids: HashSet<Option<String>> = HashSet::from([
                 None,
-                // TODO: perhaps we should first look at the domain_scope and than user domain.
+                // TODO: perhaps we should first look at the domain_scope and
+                // than user domain.
                 user_auth.principal().domain_id(),
             ]);
             Some(domain_ids)
@@ -245,6 +246,7 @@ mod tests {
                 provider_types::IdentityProviderListParameters {
                     name: Some("name".into()),
                     domain_ids: Some(HashSet::from([Some("did".into())])),
+                    bound_issuer: None,
                     pagination: ListPagination {
                         limit: Some(20),
                         marker: None,
@@ -299,6 +301,7 @@ mod tests {
                 provider_types::IdentityProviderListParameters {
                     name: Some("name".into()),
                     domain_ids: Some(HashSet::from([None, Some("domain_id".into())])),
+                    bound_issuer: None,
                     pagination: ListPagination {
                         limit: None,
                         marker: None,
@@ -356,6 +359,7 @@ mod tests {
                 provider_types::IdentityProviderListParameters {
                     name: Some("name".into()),
                     domain_ids: Some(HashSet::from([None, Some("domain_id".into())])),
+                    bound_issuer: None,
                     pagination: ListPagination {
                         limit: None,
                         marker: None,
@@ -414,6 +418,7 @@ mod tests {
             .withf(|_, qp: &provider_types::IdentityProviderListParameters| {
                 provider_types::IdentityProviderListParameters {
                     domain_ids: Some(HashSet::from([None, Some("domain_id".into())])),
+                    bound_issuer: None,
                     pagination: ListPagination {
                         limit: Some(1),
                         ..Default::default()
@@ -484,6 +489,7 @@ mod tests {
             .withf(|_, qp: &provider_types::IdentityProviderListParameters| {
                 provider_types::IdentityProviderListParameters {
                     domain_ids: Some(HashSet::from([None, Some("domain_id".into())])),
+                    bound_issuer: None,
                     pagination: ListPagination {
                         limit: Some(1),
                         ..Default::default()

@@ -38,6 +38,13 @@ pub trait IdentityBackend: Send + Sync {
         true
     }
 
+    /// Whether this backend rejects every mutation (LDAP). Lets a cascading
+    /// operation fail before it touches anything that depends on the mutation
+    /// succeeding.
+    fn is_read_only(&self) -> bool {
+        false
+    }
+
     /// Add the user to the group.
     ///
     /// # Parameters
@@ -58,12 +65,14 @@ pub trait IdentityBackend: Send + Sync {
     /// - `user_id`: The ID of the user.
     /// - `group_id`: The ID of the group.
     /// - `idp_id`: The ID of the identity provider.
+    /// - `last_verified`: Optional last verification time; defaults to now.
     async fn add_user_to_group_expiring<'a>(
         &self,
         state: &ServiceState,
         user_id: &'a str,
         group_id: &'a str,
         idp_id: &'a str,
+        last_verified: Option<&'a DateTime<Utc>>,
     ) -> Result<(), IdentityProviderError>;
 
     /// Add user group membership relations.
@@ -83,11 +92,13 @@ pub trait IdentityBackend: Send + Sync {
     /// - `state`: The service state.
     /// - `memberships`: A list of (user ID, group ID) tuples.
     /// - `idp_id`: The ID of the identity provider.
+    /// - `last_verified`: Optional last verification time; defaults to now.
     async fn add_users_to_groups_expiring<'a>(
         &self,
         state: &ServiceState,
         memberships: Vec<(&'a str, &'a str)>,
         idp_id: &'a str,
+        last_verified: Option<&'a DateTime<Utc>>,
     ) -> Result<(), IdentityProviderError>;
 
     /// Authenticate a user by a password.
@@ -224,6 +235,27 @@ pub trait IdentityBackend: Send + Sync {
         state: &ServiceState,
         user_id: &'a str,
     ) -> Result<Option<UserResponse>, IdentityProviderError>;
+
+    /// Get the minimal user data required to authorize a request.
+    ///
+    /// Drivers should override this with a lookup that skips everything but
+    /// the identity, the domain and the effective `enabled` flag. The default
+    /// loads the complete user.
+    ///
+    /// # Parameters
+    /// - `state`: The service state.
+    /// - `user_id`: The ID of the user to retrieve.
+    async fn get_user_core<'a>(
+        &self,
+        state: &ServiceState,
+        user_id: &'a str,
+    ) -> Result<Option<UserCore>, IdentityProviderError> {
+        Ok(self
+            .get_user(state, user_id)
+            .await?
+            .as_ref()
+            .map(UserCore::from))
+    }
 
     /// Get single user by ID.
     ///

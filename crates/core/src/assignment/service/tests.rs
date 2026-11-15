@@ -170,6 +170,103 @@ async fn test_list_assignments_include_names() {
     );
 }
 
+/// The names are resolved for the listed roles only and without the options.
+#[tokio::test]
+async fn test_list_assignments_include_names_asks_only_for_listed_roles() {
+    let mut role_mock = MockRoleProvider::default();
+    role_mock
+        .expect_list_roles()
+        .withf(|_, params: &RoleListParameters| {
+            params.skip_options
+                && params.ids.as_ref().is_some_and(|ids| {
+                    let mut ids = ids.clone();
+                    ids.sort();
+                    ids == ["rid1", "rid2"]
+                })
+        })
+        .times(1)
+        .returning(|_, _| {
+            Ok(vec![
+                RoleBuilder::default()
+                    .id("rid1")
+                    .name("rid1_name")
+                    .build()
+                    .unwrap(),
+                RoleBuilder::default()
+                    .id("rid2")
+                    .name("rid2_name")
+                    .build()
+                    .unwrap(),
+            ])
+        });
+    let state = get_mocked_state(None, Some(Provider::mocked_builder().mock_role(role_mock))).await;
+    let mut backend = MockAssignmentBackend::default();
+    backend.expect_list_assignments().returning(|_, _| {
+        // The same role twice: the ID must be requested once.
+        Ok(["rid1", "rid2", "rid1"]
+            .into_iter()
+            .map(|role_id| {
+                AssignmentBuilder::default()
+                    .actor_id("actor")
+                    .role_id(role_id)
+                    .target_id("target_id")
+                    .r#type(AssignmentType::UserProject)
+                    .build()
+                    .unwrap()
+            })
+            .collect())
+    });
+    let provider = AssignmentService::from_backend(Arc::new(backend));
+
+    let res = provider
+        .list_role_assignments(
+            &ExecutionContext::internal(&state),
+            &RoleAssignmentListParameters {
+                include_names: Some(true),
+                resolve_implied_roles: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(3, res.len());
+    assert!(
+        res.iter()
+            .all(|a| a.role_name.as_deref() == Some(&format!("{}_name", a.role_id)))
+    );
+}
+
+/// Nothing is asked from the role provider when there is nothing to name.
+#[tokio::test]
+async fn test_list_assignments_include_names_no_assignments_no_role_lookup() {
+    // No expectation on `list_roles`: a call would fail the mock.
+    let state = get_mocked_state(
+        None,
+        Some(Provider::mocked_builder().mock_role(MockRoleProvider::default())),
+    )
+    .await;
+    let mut backend = MockAssignmentBackend::default();
+    backend
+        .expect_list_assignments()
+        .returning(|_, _| Ok(Vec::new()));
+    let provider = AssignmentService::from_backend(Arc::new(backend));
+
+    assert!(
+        provider
+            .list_role_assignments(
+                &ExecutionContext::internal(&state),
+                &RoleAssignmentListParameters {
+                    include_names: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
 #[tokio::test]
 async fn test_revoke_grant() {
     let mut revoke_mock = MockRevokeProvider::default();
@@ -538,4 +635,87 @@ async fn test_create_grant_unrelated_conflict_is_reported() {
         )
         .await;
     assert!(matches!(res, Err(AssignmentProviderError::Conflict(_))));
+}
+
+fn role_grant(actor: &str, target: &str, role: &str, inherited: bool) -> Assignment {
+    AssignmentBuilder::default()
+        .actor_id(actor)
+        .role_id(role)
+        .target_id(target)
+        .r#type(AssignmentType::UserProject)
+        .inherited(inherited)
+        .build()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn test_delete_assignments_for_role_lists_once_and_revokes_each_grant() {
+    let mut revoke_mock = MockRevokeProvider::default();
+    revoke_mock
+        .expect_create_revocation_event()
+        .times(2)
+        .returning(|_, _| Ok(RevocationEvent::default()));
+    let state = get_mocked_state(
+        None,
+        Some(Provider::mocked_builder().mock_revoke(revoke_mock)),
+    )
+    .await;
+    let mut backend = MockAssignmentBackend::default();
+    backend
+        .expect_list_assignments()
+        .times(1)
+        .withf(|_, params: &RoleAssignmentListParameters| {
+            params.role_id.as_deref() == Some("rid") && params.inherited.is_none()
+        })
+        .returning(|_, _| {
+            Ok(vec![
+                role_grant("u1", "p1", "rid", false),
+                role_grant("u2", "p2", "rid", true),
+                // Not the role: filtered out.
+                role_grant("u3", "p3", "other", false),
+            ])
+        });
+    backend
+        .expect_revoke_grant()
+        .times(2)
+        .withf(|_, grant: &Assignment| grant.role_id == "rid")
+        .returning(|_, _| Ok(()));
+    let provider = AssignmentService::from_backend(Arc::new(backend));
+
+    provider
+        .delete_assignments_for_role(&ExecutionContext::internal(&state), "rid")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_delete_assignments_for_role_skips_a_backend_that_cannot_list_by_role() {
+    let state = get_mocked_state(None, Some(Provider::mocked_builder())).await;
+    let mut backend = MockAssignmentBackend::default();
+    backend
+        .expect_list_assignments()
+        .returning(|_, _| Err(AssignmentProviderError::NotImplemented("by role".into())));
+    backend.expect_revoke_grant().never();
+    let provider = AssignmentService::from_backend(Arc::new(backend));
+
+    provider
+        .delete_assignments_for_role(&ExecutionContext::internal(&state), "rid")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_delete_assignments_for_role_propagates_a_backend_error() {
+    let state = get_mocked_state(None, Some(Provider::mocked_builder())).await;
+    let mut backend = MockAssignmentBackend::default();
+    backend
+        .expect_list_assignments()
+        .returning(|_, _| Err(AssignmentProviderError::Driver("boom".into())));
+    let provider = AssignmentService::from_backend(Arc::new(backend));
+
+    let err = provider
+        .delete_assignments_for_role(&ExecutionContext::internal(&state), "rid")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AssignmentProviderError::Driver(_)));
 }

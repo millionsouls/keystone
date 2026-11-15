@@ -243,6 +243,10 @@ impl From<RoleProviderError> for KeystoneApiError {
             ref err @ RoleProviderError::Conflict(..) => Self::Conflict(err.to_string()),
             ref err @ RoleProviderError::Validation { .. } => Self::BadRequest(err.to_string()),
             err @ RoleProviderError::Immutable(..) => Self::forbidden(err),
+            // A cascade of the role deletion failed: keep the classification
+            // of the inner error (409, 501, ...).
+            RoleProviderError::AssignmentProvider { source } => (*source).into(),
+            RoleProviderError::ApplicationCredentialProvider { source } => (*source).into(),
             other => Self::InternalError(other.to_string()),
         }
     }
@@ -667,9 +671,9 @@ impl From<AuthPluginIdentityProviderError> for KeystoneApiError {
             AuthPluginIdentityProviderError::RaftNotAvailable => Self::NotImplemented(
                 "auth plugin identity provider requires distributed storage (raft)".to_string(),
             ),
-            // Every other variant is an infra/storage failure with no client-actionable
-            // distinction (ADR 0025 §6.B/§6.C); surface as a generic 500 without
-            // leaking backend detail on the linking path.
+            // Every other variant is an infra/storage failure with no
+            // client-actionable distinction (ADR 0025 §6.B/§6.C); surface as a
+            // generic 500 without leaking backend detail on the linking path.
             AuthPluginIdentityProviderError::RaftStoreError { source }
                 if is_storage_unavailable(source.as_ref()) =>
             {
@@ -788,7 +792,8 @@ impl From<ScimRealmProviderError> for KeystoneApiError {
             ScimRealmProviderError::StructBuilder(e) => {
                 Self::InternalError(format!("structure builder error: {e}"))
             }
-            // ScimRealmProviderError is non-exhaustive; catch any future variants
+            // ScimRealmProviderError is non-exhaustive; catch any future
+            // variants
             _ => Self::InternalError(value.to_string()),
         }
     }
@@ -822,7 +827,8 @@ impl From<ScimResourceProviderError> for KeystoneApiError {
             ScimResourceProviderError::StructBuilder(e) => {
                 Self::InternalError(format!("structure builder error: {e}"))
             }
-            // ScimResourceProviderError is non-exhaustive; catch any future variants
+            // ScimResourceProviderError is non-exhaustive; catch any future
+            // variants
             _ => Self::InternalError(value.to_string()),
         }
     }

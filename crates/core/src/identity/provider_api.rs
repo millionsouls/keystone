@@ -45,12 +45,14 @@ pub trait IdentityApi: Send + Sync {
     /// - `user_id`: The ID of the user.
     /// - `group_id`: The ID of the group.
     /// - `idp_id`: The ID of the identity provider.
+    /// - `last_verified`: Optional last verification time; defaults to now.
     async fn add_user_to_group_expiring<'a>(
         &self,
         ctx: &ExecutionContext<'a>,
         user_id: &'a str,
         group_id: &'a str,
         idp_id: &'a str,
+        last_verified: Option<&'a DateTime<Utc>>,
     ) -> Result<(), IdentityProviderError>;
 
     /// Add user group memberships as specified by (uid, gid) tuples.
@@ -70,11 +72,13 @@ pub trait IdentityApi: Send + Sync {
     /// - `state`: The service state.
     /// - `memberships`: A list of (user ID, group ID) tuples.
     /// - `idp_id`: The ID of the identity provider.
+    /// - `last_verified`: Optional last verification time; defaults to now.
     async fn add_users_to_groups_expiring<'a>(
         &self,
         ctx: &ExecutionContext<'a>,
         memberships: Vec<(&'a str, &'a str)>,
         idp_id: &'a str,
+        last_verified: Option<&'a DateTime<Utc>>,
     ) -> Result<(), IdentityProviderError>;
 
     /// Authenticate a user by their password.
@@ -179,6 +183,27 @@ pub trait IdentityApi: Send + Sync {
         ctx: &ExecutionContext<'a>,
         user_id: &'a str,
     ) -> Result<Option<UserResponse>, IdentityProviderError>;
+
+    /// Get the minimal user data required to authorize a request.
+    ///
+    /// Unlike [`Self::get_user`] this skips everything but the identity, the
+    /// domain and the effective `enabled` flag and never populates the full
+    /// user cache with partial data.
+    ///
+    /// # Parameters
+    /// - `ctx`: The execution context.
+    /// - `user_id`: The ID of the user to retrieve.
+    async fn get_user_core<'a>(
+        &self,
+        ctx: &ExecutionContext<'a>,
+        user_id: &'a str,
+    ) -> Result<Option<UserCore>, IdentityProviderError> {
+        Ok(self
+            .get_user(ctx, user_id)
+            .await?
+            .as_ref()
+            .map(UserCore::from))
+    }
 
     /// Get single user by ID.
     ///

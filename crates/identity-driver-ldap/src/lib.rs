@@ -143,6 +143,11 @@ impl IdentityBackend for LdapBackend {
         false
     }
 
+    #[tracing::instrument(name = "driver.ldap.identity.is_read_only", level = "debug", skip_all)]
+    fn is_read_only(&self) -> bool {
+        true
+    }
+
     #[tracing::instrument(name = "driver.ldap.identity.add_user_to_group", level = "debug", skip_all, fields(user_id = %_user_id, group_id = %_group_id))]
     async fn add_user_to_group<'a>(
         &self,
@@ -160,6 +165,7 @@ impl IdentityBackend for LdapBackend {
         _user_id: &'a str,
         _group_id: &'a str,
         _idp_id: &'a str,
+        _last_verified: Option<&'a DateTime<Utc>>,
     ) -> Result<(), IdentityProviderError> {
         Err(not_implemented("expiring group membership"))
     }
@@ -183,6 +189,7 @@ impl IdentityBackend for LdapBackend {
         _state: &ServiceState,
         _memberships: Vec<(&'a str, &'a str)>,
         _idp_id: &'a str,
+        _last_verified: Option<&'a DateTime<Utc>>,
     ) -> Result<(), IdentityProviderError> {
         Err(not_implemented("expiring group membership"))
     }

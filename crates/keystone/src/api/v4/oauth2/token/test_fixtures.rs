@@ -139,13 +139,10 @@ pub(super) fn successful_auth_result() -> openstack_keystone_core_types::auth::A
         .authorization(
             AuthzInfoBuilder::default()
                 .scope(ScopeInfo::Domain(
-                    openstack_keystone_core_types::resource::Domain {
+                    openstack_keystone_core_types::resource::DomainRef {
                         id: "domain-1".to_string(),
                         name: String::new(),
-                        description: None,
                         enabled: true,
-                        extra: Default::default(),
-                        options: Default::default(),
                     },
                 ))
                 .roles(vec![RoleRef {
@@ -161,6 +158,7 @@ pub(super) fn successful_auth_result() -> openstack_keystone_core_types::auth::A
 }
 
 pub(super) fn ok_key_mock() -> MockOauth2KeyProvider {
+    openstack_keystone_jwt_crypto::install().unwrap();
     let mut mock = MockOauth2KeyProvider::default();
     mock.expect_active_signing_key()
         .returning(|_, _| Ok(generate_keypair(SigningAlgorithm::Es256).unwrap()));
@@ -215,10 +213,8 @@ pub(super) fn refresh_resource_mock(enabled: Option<bool>) -> MockResourceProvid
             enabled.map(|enabled| openstack_keystone_core_types::resource::Domain {
                 id: "domain-1".to_string(),
                 name: "domain-1".to_string(),
-                description: None,
                 enabled,
-                extra: Default::default(),
-                options: Default::default(),
+                ..Default::default()
             }),
         )
     });
@@ -330,6 +326,7 @@ pub(in crate::api::v4::oauth2) fn dpop_proof_for(
         URL_SAFE_NO_PAD.encode(header.to_string()),
         URL_SAFE_NO_PAD.encode(claims.to_string())
     );
+    openstack_keystone_jwt_crypto::install().unwrap();
     let key = jsonwebtoken::EncodingKey::from_ec_pem(DPOP_TEST_KEY_PEM.as_bytes()).unwrap();
     let signature =
         jsonwebtoken::crypto::sign(message.as_bytes(), &key, jsonwebtoken::Algorithm::ES256)

@@ -92,17 +92,7 @@ pub(super) async fn delete(
             &exec,
             RevocationEventCreate {
                 domain_id: Some(realm.domain_id.clone()),
-                project_id: None,
-                user_id: Some(id.clone()),
-                role_id: None,
-                trust_id: None,
-                consumer_id: None,
-                access_token_id: None,
-                issued_before: Utc::now(),
-                expires_at: None,
-                audit_id: None,
-                audit_chain_id: None,
-                revoked_at: Utc::now(),
+                ..RevocationEventCreate::for_user(id.clone(), Utc::now())
             },
         )
         .await?;
@@ -137,7 +127,6 @@ mod tests {
         SecurityContext, UserIdentityInfoBuilder,
     };
     use openstack_keystone_core_types::identity::UserResponseBuilder;
-    use openstack_keystone_core_types::resource::Domain;
     use openstack_keystone_core_types::revoke::RevocationEvent;
     use openstack_keystone_core_types::scim::ScimResourceIndex;
 
@@ -155,14 +144,13 @@ mod tests {
             .unwrap();
         let authz = AuthzInfoBuilder::default()
             .roles(Vec::new())
-            .scope(ScopeInfo::Domain(Domain {
-                id: domain_id.to_string(),
-                name: String::new(),
-                description: None,
-                enabled: true,
-                extra: Default::default(),
-                options: Default::default(),
-            }))
+            .scope(ScopeInfo::Domain(
+                openstack_keystone_core_types::resource::DomainRef {
+                    id: domain_id.to_string(),
+                    name: String::new(),
+                    enabled: true,
+                },
+            ))
             .build()
             .unwrap();
         let sc = SecurityContext::test_build()

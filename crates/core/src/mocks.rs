@@ -877,6 +877,12 @@ mod application_credential {
                 project_id: &'a str,
             ) -> Result<(), ApplicationCredentialProviderError>;
 
+            async fn delete_application_credentials_for_role<'a>(
+                &self,
+                ctx: &ExecutionContext<'a>,
+                role_id: &'a str,
+            ) -> Result<(), ApplicationCredentialProviderError>;
+
             async fn get_access_rule<'a>(
                 &self,
                 ctx: &ExecutionContext<'a>,
@@ -1078,6 +1084,12 @@ mod assignment {
                 &self,
                 ctx: &ExecutionContext<'a>,
                 domain_id: &'a str,
+            ) -> Result<(), AssignmentProviderError>;
+
+            async fn delete_assignments_for_role<'a>(
+                &self,
+                ctx: &ExecutionContext<'a>,
+                role_id: &'a str,
             ) -> Result<(), AssignmentProviderError>;
 
             async fn delete_assignments_for_project<'a>(
@@ -1344,6 +1356,13 @@ mod federation {
                 id: &'a str,
             ) -> Result<Option<IdentityProvider>, FederationProviderError>;
 
+            async fn get_identity_provider_by_issuer<'a>(
+                &self,
+                ctx: &ExecutionContext<'a>,
+                domain_id: &'a str,
+                issuer: &'a str,
+            ) -> Result<Option<IdentityProvider>, FederationProviderError>;
+
             async fn list_identity_providers<'a>(
                 &self,
                 ctx: &ExecutionContext<'a>,
@@ -1386,6 +1405,7 @@ mod identity {
                 user_id: &'a str,
                 group_id: &'a str,
                 idp_id: &'a str,
+                last_verified: Option<&'a DateTime<Utc>>,
             ) -> Result<(), IdentityProviderError>;
 
             async fn add_users_to_groups<'a>(
@@ -1399,6 +1419,7 @@ mod identity {
                 ctx: &ExecutionContext<'a>,
                 memberships: Vec<(&'a str, &'a str)>,
                 idp_id: &'a str,
+                last_verified: Option<&'a DateTime<Utc>>,
             ) -> Result<(), IdentityProviderError>;
 
             async fn authenticate_by_password<'a>(
@@ -1463,6 +1484,12 @@ mod identity {
                 ctx: &ExecutionContext<'a>,
                 user_id: &'a str,
             ) -> Result<Option<UserResponse>, IdentityProviderError>;
+
+            async fn get_user_core<'a>(
+                &self,
+                ctx: &ExecutionContext<'a>,
+                user_id: &'a str,
+            ) -> Result<Option<UserCore>, IdentityProviderError>;
 
             async fn get_user_domain_id<'a>(
                 &self,
@@ -1798,12 +1825,6 @@ mod resource {
                 project: ProjectCreate,
             ) -> Result<Project, ResourceProviderError>;
 
-            async fn get_project_parents<'a>(
-                &self,
-                ctx: &ExecutionContext<'a>,
-                project_id: &'a str,
-            ) -> Result<Option<Vec<Project>>, ResourceProviderError>;
-
             async fn create_project_tag<'a>(
                 &self,
                 ctx: &ExecutionContext<'a>,
@@ -1842,6 +1863,12 @@ mod resource {
                 domain_id: &'a str,
             ) -> Result<Option<Domain>, ResourceProviderError>;
 
+            async fn get_domain_ref<'a>(
+                &self,
+                ctx: &ExecutionContext<'a>,
+                domain_id: &'a str,
+            ) -> Result<Option<DomainRef>, ResourceProviderError>;
+
             async fn get_domain_enabled<'a>(
                 &self,
                 ctx: &ExecutionContext<'a>,
@@ -1862,6 +1889,30 @@ mod resource {
             ) -> Result<Option<Project>, ResourceProviderError>;
 
             async fn get_project_subtree<'a>(
+                &self,
+                ctx: &ExecutionContext<'a>,
+                project_id: &'a str,
+            ) -> Result<Option<Vec<Project>>, ResourceProviderError>;
+
+            async fn get_project_domain_id<'a>(
+                &self,
+                ctx: &ExecutionContext<'a>,
+                project_id: &'a str,
+            ) -> Result<Option<String>, ResourceProviderError>;
+
+            async fn get_project_ref<'a>(
+                &self,
+                ctx: &ExecutionContext<'a>,
+                project_id: &'a str,
+            ) -> Result<Option<ProjectRef>, ResourceProviderError>;
+
+            async fn get_project_parent_ids<'a>(
+                &self,
+                ctx: &ExecutionContext<'a>,
+                project_id: &'a str,
+            ) -> Result<Option<Vec<String>>, ResourceProviderError>;
+
+            async fn get_project_parents<'a>(
                 &self,
                 ctx: &ExecutionContext<'a>,
                 project_id: &'a str,
@@ -1923,6 +1974,11 @@ mod revoke {
 
         #[async_trait]
         impl RevokeApi for RevokeProvider {
+            async fn cleanup<'a>(
+                &self,
+                ctx: &ExecutionContext<'a>,
+            ) -> Result<u64, RevokeProviderError>;
+
             async fn create_revocation_event<'a>(
                 &self,
                 ctx: &ExecutionContext<'a>,
@@ -2062,6 +2118,12 @@ mod token {
                 credential: &SecretString,
                 allow_expired: Option<bool>,
                 window_seconds: Option<i64>,
+            ) -> Result<ValidatedSecurityContext, TokenProviderError>;
+
+            async fn authorize_request_token<'a>(
+                &self,
+                ctx: &ExecutionContext<'a>,
+                credential: &SecretString,
             ) -> Result<ValidatedSecurityContext, TokenProviderError>;
 
             async fn validate_to_context<'a>(
