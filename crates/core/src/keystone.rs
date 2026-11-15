@@ -114,6 +114,9 @@ pub struct Service {
     /// DPoP replay cache and nonce generator (ADR 0043 §2).
     pub dpop: crate::oauth2_client::dpop_runtime::DpopRuntime,
 
+    /// Process-local external assertion replay cache, when explicitly enabled.
+    pub assertion_replay: Option<crate::oauth2_client::assertion_replay::AssertionReplayCache>,
+
     /// Loaded dynamic auth plugins (ADR 0025). Empty (an
     /// [`EmptyAuthPluginRuntime`]) until `crates/keystone`'s
     /// `load_auth_plugins` runs post-construction - `CoreHostFunctions`
@@ -229,6 +232,26 @@ impl Service {
         let dpop =
             crate::oauth2_client::dpop_runtime::DpopRuntime::from_config(&*cfg.config.read().await);
 
+        let assertion_replay = if oauth2_cfg.allow_per_node_assertion_replay {
+            // The shared cache has no per-domain quota; cap the entire cache
+            // at that limit so no individual domain can exceed it.
+            let max_total = oauth2_cfg
+                .assertion_replay_cache_max_entries
+                .min(oauth2_cfg.assertion_replay_cache_max_entries_per_domain);
+            tracing::warn!(
+                max_total,
+                "external assertion replay protection is per-node and is lost on restart"
+            );
+            Some(
+                crate::oauth2_client::assertion_replay::AssertionReplayCache::new(
+                    oauth2_cfg.assertion_replay_cache_max_entries_per_issuer as usize,
+                    max_total as usize,
+                ),
+            )
+        } else {
+            None
+        };
+
         // Build rate-limiting state from config. Fails fast (Invariant 2) if
         // any enabled bucket has zero burst or replenish rate.
         let rate_limiters = {
@@ -249,6 +272,7 @@ impl Service {
             api_key_rate_limiter,
             oauth2_token_rate_limiter,
             dpop,
+            assertion_replay,
             auth_plugin_registry: RwLock::new(Arc::new(EmptyAuthPluginRuntime)),
             core_host_functions: RwLock::new(None),
             rate_limiters,

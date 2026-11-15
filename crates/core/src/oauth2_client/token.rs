@@ -135,15 +135,24 @@ pub async fn hydrate_client_credentials_context(
     Ok((vsc, ruleset.ruleset_version))
 }
 
-/// Run an external assertion's verified claims through the domain's token
-/// exchange mapping ruleset and return a fully hydrated security context.
-pub async fn hydrate_external_assertion_context(
+/// A matched assertion mapping, before any identity records are changed.
+pub struct PreparedExternalAssertionMapping {
+    scope: ScopeInfo,
+    request: MappingAuthRequest,
+    ruleset_version: u128,
+}
+
+/// Evaluate an external assertion against the domain's token exchange mapping.
+///
+/// # Errors
+/// Returns an authentication error when no enabled rule grants one valid scope.
+pub async fn prepare_external_assertion_mapping(
     state: &ServiceState,
     domain_id: &str,
     issuer: &str,
     subject: &str,
     claims: HashMap<String, Vec<String>>,
-) -> Result<(ValidatedSecurityContext, u128), AuthenticationError> {
+) -> Result<PreparedExternalAssertionMapping, AuthenticationError> {
     let source = IdentitySource::TokenExchange {
         issuer: issuer.to_string(),
     };
@@ -184,17 +193,32 @@ pub async fn hydrate_external_assertion_context(
     let scope = scope_info_from_authorization(state, &exec, authorization).await?;
     scope.validate()?;
 
-    let mapping_req = MappingAuthRequest {
-        domain_id: Some(domain_id.to_string()),
-        source,
-        unique_workload_id: subject.to_string(),
-        claims,
-        rule_name: None,
-    };
+    Ok(PreparedExternalAssertionMapping {
+        scope,
+        request: MappingAuthRequest {
+            domain_id: Some(domain_id.to_string()),
+            source,
+            unique_workload_id: subject.to_string(),
+            claims,
+            rule_name: None,
+        },
+        ruleset_version: ruleset.ruleset_version,
+    })
+}
+
+/// Authenticate and hydrate an already matched external assertion mapping.
+///
+/// # Errors
+/// Returns an authentication error if identity or scope hydration fails.
+pub async fn hydrate_external_assertion_context(
+    state: &ServiceState,
+    mapping: PreparedExternalAssertionMapping,
+) -> Result<(ValidatedSecurityContext, u128), AuthenticationError> {
+    let exec = ExecutionContext::internal(state);
     let auth_result = state
         .provider
         .get_mapping_provider()
-        .authenticate_by_mapping(&exec, &mapping_req)
+        .authenticate_by_mapping(&exec, &mapping.request)
         .await
         .map_err(|e| AuthenticationError::Provider {
             source: Box::new(e),
@@ -202,8 +226,8 @@ pub async fn hydrate_external_assertion_context(
         })?;
 
     let ctx = SecurityContext::try_from(auth_result)?;
-    let vsc = ValidatedSecurityContext::new_for_scope(ctx, scope, state).await?;
-    Ok((vsc, ruleset.ruleset_version))
+    let vsc = ValidatedSecurityContext::new_for_scope(ctx, mapping.scope, state).await?;
+    Ok((vsc, mapping.ruleset_version))
 }
 
 /// Resolve the mapping-matched [`Authorization`] into a [`ScopeInfo`] backed

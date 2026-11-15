@@ -98,7 +98,7 @@ pub(super) struct TokenForm {
     /// token (Fernet or JWS) or external assertion JWT being exchanged.
     #[serde(default)]
     subject_token: Option<String>,
-    /// RFC 8693 subject type: access_token, Keystone-native, or native JWT.
+    /// RFC 8693 subject type: access_token, Keystone-native, or JWT.
     #[serde(default)]
     subject_token_type: Option<String>,
     /// RFC 8693 requested output type; only access_token is supported.

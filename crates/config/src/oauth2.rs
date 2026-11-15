@@ -399,6 +399,11 @@ pub struct Oauth2Provider {
     #[serde(default = "default_assertion_replay_cache_max_entries_per_issuer")]
     #[validate(range(min = 1))]
     pub assertion_replay_cache_max_entries_per_issuer: u32,
+
+    /// Permit process-local replay protection for external assertions.
+    /// Entries are not shared across nodes or retained across restarts.
+    #[serde(default)]
+    pub allow_per_node_assertion_replay: bool,
 }
 
 fn default_assertion_replay_cache_max_entries() -> u32 {
@@ -582,6 +587,7 @@ impl Default for Oauth2Provider {
                 default_assertion_replay_cache_max_entries_per_domain(),
             assertion_replay_cache_max_entries_per_issuer:
                 default_assertion_replay_cache_max_entries_per_issuer(),
+            allow_per_node_assertion_replay: false,
         }
     }
 }

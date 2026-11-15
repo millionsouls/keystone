@@ -82,6 +82,7 @@ header instead of a 500.
 | `dpop_nonce_lifetime_seconds`           | 300     | Length of one DPoP nonce slot. A nonce is valid for the rest of its slot and the next one.                                                       |
 | `dpop_replay_cache_max_entries`         | 100000  | Live entries of the DPoP replay cache. When full, new proofs are rejected instead of evicting entries.                                           |
 | `dpop_replay_cache_max_entries_per_key` | 256     | Live replay cache entries one proof key may hold.                                                                                                |
+| `allow_per_node_assertion_replay`       | `false` | Allow external JWT exchange with a process-local replay cache. Replay protection is not shared across nodes and is lost on restart; without this opt-in exchange fails closed. Read at startup. |
 | `allow_host_header_issuer`              | `false` | **Development only.** Lets the issuer and cookie `Secure` flag follow the request `Host`/`X-Forwarded-Proto` headers when `[DEFAULT] public_endpoint` is unset. |
 | `templates_dir`                         | unset   | Directory with operator-supplied page templates (see [Customising the login pages](#customising-the-login-pages)). Read once at startup. |
 | `static_dir`                            | unset   | Directory with operator static assets (stylesheets, logos) served at `/v4/oauth2/static/`.                                                       |
@@ -97,6 +98,11 @@ header instead of a 500.
 | `sso_session_lifetime_minutes`        | 480     | Lifetime of the browser SSO session started by a successful sign-in. Later authorization requests in the same browser skip the login form while it lives. `0` is not allowed. |
 
 Exceeding a rate limit returns `429 Too Many Requests`.
+
+The process-local external assertion cache uses the configured per-issuer limit
+and caps its total entries at the smaller of the configured total and per-domain
+limits. This conservative total cap also bounds each domain. It does not provide
+cluster-wide replay protection.
 
 ## Second factor (TOTP and passkeys)
 

@@ -109,26 +109,34 @@ pub(super) async fn handle_token_exchange_grant(
     )
     .await?;
 
-    if form.subject_token_type.as_deref() == Some(super::exchange_request::JWT_TOKEN_TYPE) {
-        return super::external_assertion::handle_external_assertion_exchange(
-            state,
-            domain_id,
-            headers,
-            correlation_id,
-            form,
-            &client,
-            subject_token,
-            confirmation,
-            scope,
-            oauth2_cfg,
-        )
-        .await;
-    }
-
-    let (vsc, delegation_context, credential_expires_at) =
-        openstack_keystone_core::oauth2_client::validate_subject_token(state, &subject_token)
-            .await
-            .map_err(exchange_error)?;
+    // Only a token the native driver cannot decode is eligible for external
+    // verification. A valid native token that fails authorization must not
+    // be retried under a different trust path.
+    let native_subject =
+        openstack_keystone_core::oauth2_client::validate_subject_token(state, &subject_token).await;
+    let (vsc, delegation_context, credential_expires_at) = match native_subject {
+        Ok(subject) => subject,
+        Err(openstack_keystone_core::oauth2_client::TokenExchangeError::InvalidSubjectToken(
+            openstack_keystone_core_types::token::TokenProviderError::InvalidToken { .. },
+        )) if form.subject_token_type.as_deref()
+            == Some(super::exchange_request::JWT_TOKEN_TYPE) =>
+        {
+            return super::external_assertion::handle_external_assertion_exchange(
+                state,
+                domain_id,
+                headers,
+                correlation_id,
+                form,
+                &client,
+                subject_token,
+                confirmation,
+                scope,
+                oauth2_cfg,
+            )
+            .await;
+        }
+        Err(error) => return Err(exchange_error(error)),
+    };
 
     // The Keystone-native tokens this grant accepts carry no confirmation
     // claim. A subject token that does is a sender-constrained token whose
@@ -645,7 +653,7 @@ mod tests {
             .with_state(state);
         api.as_service()
             .oneshot(request(&format!(
-                "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange&client_id=client-1&client_secret=s3cr3t&subject_token=some-existing-token&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Ajwt{extra}"
+                "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange&client_id=client-1&client_secret=s3cr3t&subject_token=some-existing-token&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token{extra}"
             )))
             .await
             .unwrap()
@@ -795,7 +803,7 @@ mod tests {
             .await;
             let mut api = openapi_router().with_state(state);
             let response = api.as_service().oneshot(request(
-                "grant_type=urn:ietf:params:oauth:grant-type:token-exchange&client_id=client-1&client_secret=s3cr3t&subject_token=subject&subject_token_type=urn:ietf:params:oauth:token-type:access_token"
+                "grant_type=urn:ietf:params:oauth:grant-type:token-exchange&client_id=client-1&client_secret=s3cr3t&subject_token=subject&subject_token_type=urn:ietf:params:oauth:token-type:jwt"
             )).await.unwrap();
             assert_eq!(response.status(), status, "{kind}");
             let body = json_body(response).await;

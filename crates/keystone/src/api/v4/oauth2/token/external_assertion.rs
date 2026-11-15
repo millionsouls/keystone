@@ -23,6 +23,7 @@ use serde_json::Value;
 
 use openstack_keystone_config::Oauth2Provider;
 use openstack_keystone_core::auth::ExecutionContext;
+use openstack_keystone_core::oauth2_client::replay::ReplayError;
 use openstack_keystone_core::oauth2_client::{
     SubjectTokenValidationProfile, verify_subject_token_jwt,
 };
@@ -50,36 +51,6 @@ pub(super) async fn handle_external_assertion_exchange(
     confirmation: Option<Confirmation>,
     scope: String,
     oauth2_cfg: &Oauth2Provider,
-) -> Result<Response, Oauth2TokenError> {
-    handle_external_assertion_exchange_with_replay(
-        state,
-        domain_id,
-        headers,
-        correlation_id,
-        form,
-        client,
-        subject_token,
-        confirmation,
-        scope,
-        oauth2_cfg,
-        &ReplayProtectionUnavailable,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn handle_external_assertion_exchange_with_replay(
-    state: &ServiceState,
-    domain_id: &str,
-    headers: &HeaderMap,
-    correlation_id: &str,
-    form: &TokenForm,
-    client: &OAuth2ClientResource,
-    subject_token: String,
-    confirmation: Option<Confirmation>,
-    scope: String,
-    oauth2_cfg: &Oauth2Provider,
-    replay_protection: &dyn AssertionReplayProtection,
 ) -> Result<Response, Oauth2TokenError> {
     let unverified_issuer = extract_unverified_issuer(&subject_token)
         .ok_or_else(|| Oauth2TokenError::invalid_grant("subject_token is not a valid JWT"))?;
@@ -120,16 +91,22 @@ async fn handle_external_assertion_exchange_with_replay(
         .get("exp")
         .and_then(Value::as_i64)
         .ok_or_else(|| Oauth2TokenError::invalid_grant("subject_token has no valid expiry"))?;
+    // The verifier allows clock skew, but an expired assertion cannot bound
+    // a newly issued token to a positive lifetime.
+    if assertion_exp <= chrono::Utc::now().timestamp() {
+        return Err(Oauth2TokenError::invalid_grant("subject_token has expired"));
+    }
     let assertion_jti = verified_claims
         .get("jti")
         .and_then(Value::as_str)
         .filter(|jti| !jti.is_empty() && jti.len() <= 256)
         .ok_or_else(|| Oauth2TokenError::invalid_grant("subject_token has no valid jti"))?;
 
-    replay_protection
-        .check_and_record(domain_id, &unverified_issuer, assertion_jti, assertion_exp)
-        .await
-        .map_err(map_replay_protection_error)?;
+    let replay_cache = state.assertion_replay.as_ref().ok_or_else(|| {
+        Oauth2TokenError::server_error_unavailable(
+            "external assertion replay protection is not available",
+        )
+    })?;
 
     let subject = verified_claims
         .get("sub")
@@ -140,16 +117,30 @@ async fn handle_external_assertion_exchange_with_replay(
             tracing::warn!(error = %error, "external assertion claims could not be mapped");
             Oauth2TokenError::invalid_grant("subject_token claims could not be mapped")
         })?;
-    let (vsc, ruleset_version) =
-        openstack_keystone_core::oauth2_client::hydrate_external_assertion_context(
-            state,
+    let mapping = openstack_keystone_core::oauth2_client::prepare_external_assertion_mapping(
+        state,
+        domain_id,
+        &unverified_issuer,
+        subject,
+        flattened,
+    )
+    .await
+    .map_err(map_mapping_error)?;
+
+    replay_cache
+        .check_and_insert(
             domain_id,
             &unverified_issuer,
-            subject,
-            flattened,
+            assertion_jti,
+            assertion_exp,
+            chrono::Utc::now().timestamp(),
         )
-        .await
-        .map_err(map_mapping_error)?;
+        .map_err(map_replay_protection_error)?;
+
+    let (vsc, ruleset_version) =
+        openstack_keystone_core::oauth2_client::hydrate_external_assertion_context(state, mapping)
+            .await
+            .map_err(map_mapping_error)?;
 
     let audience = requested_audience(state, &form.audience).await?;
     let issuer = format!("{base}/v4/oauth2/{domain_id}");
@@ -251,46 +242,16 @@ async fn load_identity_provider_jwks(
         })
 }
 
-#[async_trait::async_trait]
-trait AssertionReplayProtection: Send + Sync {
-    async fn check_and_record(
-        &self,
-        domain_id: &str,
-        issuer: &str,
-        jti: &str,
-        expires_at: i64,
-    ) -> Result<(), ReplayProtectionError>;
-}
-
-#[derive(Debug)]
-enum ReplayProtectionError {
-    Unavailable,
-    #[cfg_attr(not(test), allow(dead_code))]
-    Replayed,
-}
-
-struct ReplayProtectionUnavailable;
-
-#[async_trait::async_trait]
-impl AssertionReplayProtection for ReplayProtectionUnavailable {
-    async fn check_and_record(
-        &self,
-        _domain_id: &str,
-        _issuer: &str,
-        _jti: &str,
-        _expires_at: i64,
-    ) -> Result<(), ReplayProtectionError> {
-        Err(ReplayProtectionError::Unavailable)
-    }
-}
-
-fn map_replay_protection_error(error: ReplayProtectionError) -> Oauth2TokenError {
+fn map_replay_protection_error(error: ReplayError) -> Oauth2TokenError {
     match error {
-        ReplayProtectionError::Unavailable => Oauth2TokenError::server_error_unavailable(
-            "external assertion replay protection is not available",
-        ),
-        ReplayProtectionError::Replayed => {
+        ReplayError::Replayed => {
             Oauth2TokenError::invalid_grant("subject_token assertion has already been used")
+        }
+        ReplayError::CacheFull | ReplayError::ScopeQuotaExceeded => {
+            tracing::warn!(error = %error, "external assertion replay cache capacity reached");
+            Oauth2TokenError::server_error_unavailable(
+                "external assertion replay protection is not available",
+            )
         }
     }
 }
@@ -318,8 +279,6 @@ fn map_mapping_error(error: AuthenticationError) -> Oauth2TokenError {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, sync::Mutex};
-
     use httpmock::prelude::*;
     use serde_json::json;
 
@@ -336,38 +295,17 @@ mod tests {
     use crate::federation::MockFederationProvider;
     use crate::federation::api::oidc_utils::fixtures::{TEST_KID, make_jwt, rsa_jwk};
     use crate::mapping::MockMappingProvider;
+    use crate::oauth2_client::MockOauth2ClientProvider;
     use crate::provider::Provider;
     use crate::resource::MockResourceProvider;
 
     const EXTERNAL_ISSUER: &str = "https://issuer.example";
 
-    #[derive(Default)]
-    struct TestReplayProtection(Mutex<HashSet<(String, String, String)>>);
-
-    #[async_trait::async_trait]
-    impl AssertionReplayProtection for TestReplayProtection {
-        async fn check_and_record(
-            &self,
-            domain_id: &str,
-            issuer: &str,
-            jti: &str,
-            _expires_at: i64,
-        ) -> Result<(), ReplayProtectionError> {
-            let Ok(mut seen) = self.0.lock() else {
-                return Err(ReplayProtectionError::Unavailable);
-            };
-            if seen.insert((domain_id.to_string(), issuer.to_string(), jti.to_string())) {
-                Ok(())
-            } else {
-                Err(ReplayProtectionError::Replayed)
-            }
-        }
-    }
-
     async fn test_state(
         issuer: &str,
         idp: Option<IdentityProvider>,
         configure_mapping: bool,
+        allow_replay: bool,
     ) -> crate::keystone::ServiceState {
         let expected_issuer = issuer.to_string();
         let mut federation = MockFederationProvider::default();
@@ -398,6 +336,7 @@ mod tests {
             let expected_issuer = issuer.to_string();
             mapping
                 .expect_authenticate_by_mapping()
+                .times(1)
                 .returning(move |_, request| {
                     assert_eq!(request.domain_id.as_deref(), Some("domain-1"));
                     assert_eq!(request.source, expected_source);
@@ -406,6 +345,9 @@ mod tests {
                     assert!(request.claims["sub"].contains(&"external-user".to_string()));
                     assert!(request.claims["aud"].contains(&assertion_audience()));
                     assert!(request.claims["jti"].contains(&"assertion-1".to_string()));
+                    assert!(
+                        request.claims["preferred_username"].contains(&"exchange-user".to_string())
+                    );
                     Ok(successful_auth_result())
                 });
         }
@@ -419,12 +361,42 @@ mod tests {
             }))
         });
 
+        let client = OAuth2ClientResource {
+            grant_types: vec![
+                openstack_keystone_core_types::oauth2_client::GrantType::TokenExchange,
+            ],
+            ..confidential_client().await
+        };
+        let mut clients = MockOauth2ClientProvider::default();
+        clients
+            .expect_effective_dpop_mode()
+            .returning(|_, _, _| Ok(openstack_keystone_config::DpopMode::Disabled));
+        clients
+            .expect_get_by_client_id()
+            .returning(move |_, _| Ok(Some(client.clone())));
+        let mut tokens = crate::token::MockTokenProvider::default();
+        tokens.expect_validate_to_context().returning(|_, _, _, _| {
+            Err(
+                openstack_keystone_core_types::token::TokenProviderError::InvalidToken {
+                    source: Box::new(std::io::Error::other("not a native token")),
+                },
+            )
+        });
+
         let provider = Provider::mocked_builder()
             .mock_federation(federation)
             .mock_mapping(mapping)
             .mock_resource(resource)
+            .mock_oauth2_client(clients)
+            .mock_token(tokens)
             .mock_oauth2_key(ok_key_mock());
-        openstack_keystone_core::api::tests::get_mocked_state(provider, true, None).await
+        let mut config = openstack_keystone_config::Config::default();
+        config.oauth2.allow_host_header_issuer = true;
+        config.oauth2.allow_per_node_assertion_replay = allow_replay;
+        openstack_keystone_core::api::tests::get_mocked_state_with_config(
+            provider, true, None, config,
+        )
+        .await
     }
 
     fn test_idp(issuer: &str, jwks_url: &str) -> IdentityProvider {
@@ -435,31 +407,6 @@ mod tests {
             jwks_url: Some(jwks_url.to_string()),
             ..Default::default()
         }
-    }
-
-    async fn exchange(
-        state: &crate::keystone::ServiceState,
-        subject_token: String,
-        replay_protection: &dyn AssertionReplayProtection,
-    ) -> Result<Response, Oauth2TokenError> {
-        let client: OAuth2ClientResource = confidential_client().await;
-        handle_external_assertion_exchange_with_replay(
-            state,
-            "domain-1",
-            &HeaderMap::new(),
-            "test-correlation",
-            &TokenForm::default(),
-            &client,
-            subject_token,
-            None,
-            "openstack:api".to_string(),
-            &Oauth2Provider {
-                access_token_lifetime_minutes: 1,
-                ..Default::default()
-            },
-            replay_protection,
-        )
-        .await
     }
 
     async fn production_exchange(
@@ -485,6 +432,32 @@ mod tests {
         .await
     }
 
+    async fn dispatched_exchange(
+        state: &crate::keystone::ServiceState,
+        subject_token: String,
+    ) -> Result<Response, Oauth2TokenError> {
+        let form = TokenForm {
+            client_id: Some("client-1".to_string()),
+            client_secret: Some("s3cr3t".to_string()),
+            subject_token: Some(subject_token),
+            subject_token_type: Some(super::super::exchange_request::JWT_TOKEN_TYPE.to_string()),
+            ..Default::default()
+        };
+        super::super::token_exchange::handle_token_exchange_grant(
+            state,
+            "domain-1",
+            &HeaderMap::new(),
+            None,
+            &form,
+            &Oauth2Provider {
+                access_token_lifetime_minutes: 1,
+                ..Default::default()
+            },
+            "test-correlation",
+        )
+        .await
+    }
+
     async fn jwks_server() -> (MockServer, String) {
         let server = MockServer::start_async().await;
         let jwks = json!({"keys": [rsa_jwk(TEST_KID)]});
@@ -501,13 +474,16 @@ mod tests {
     }
 
     fn assertion_token(issuer: &str, audience: &str, jti: &str, kid: &str) -> (String, i64) {
-        let exp = chrono::Utc::now().timestamp() + 45;
+        let now = chrono::Utc::now().timestamp();
+        let exp = now + 45;
         let claims = json!({
             "iss": issuer,
             "sub": "external-user",
             "aud": audience,
+            "iat": now,
             "exp": exp,
             "jti": jti,
+            "preferred_username": "exchange-user",
         });
         (make_jwt(&claims, Some(kid)), exp)
     }
@@ -533,7 +509,7 @@ mod tests {
     async fn production_handler_fails_closed_before_mapping_without_replay_cache() {
         let (_server, jwks_url) = jwks_server().await;
         let idp = test_idp(EXTERNAL_ISSUER, &jwks_url);
-        let state = test_state(EXTERNAL_ISSUER, Some(idp), false).await;
+        let state = test_state(EXTERNAL_ISSUER, Some(idp), false, false).await;
         let (token, _) = assertion_token(
             EXTERNAL_ISSUER,
             &assertion_audience(),
@@ -541,7 +517,7 @@ mod tests {
             TEST_KID,
         );
 
-        let Err(error) = production_exchange(&state, token).await else {
+        let Err(error) = dispatched_exchange(&state, token).await else {
             panic!("production exchange must fail closed without replay protection");
         };
         assert_eq!(error.error_code(), "server_error");
@@ -552,16 +528,14 @@ mod tests {
     async fn external_exchange_verifies_maps_mints_claims_and_rejects_replay() {
         let (_server, jwks_url) = jwks_server().await;
         let idp = test_idp(EXTERNAL_ISSUER, &jwks_url);
-        let state = test_state(EXTERNAL_ISSUER, Some(idp), true).await;
+        let state = test_state(EXTERNAL_ISSUER, Some(idp), true, true).await;
         let (token, assertion_exp) = assertion_token(
             EXTERNAL_ISSUER,
             &assertion_audience(),
             "assertion-1",
             TEST_KID,
         );
-        let replay_protection = TestReplayProtection::default();
-
-        let Ok(response) = exchange(&state, token.clone(), &replay_protection).await else {
+        let Ok(response) = dispatched_exchange(&state, token.clone()).await else {
             panic!("valid external assertion exchange should succeed");
         };
         assert_eq!(response.status(), StatusCode::OK);
@@ -579,7 +553,7 @@ mod tests {
         assert_eq!(claims["user_id"], "shadow-1");
         assert_eq!(claims["roles"][0], "member");
 
-        let Err(error) = exchange(&state, token, &replay_protection).await else {
+        let Err(error) = dispatched_exchange(&state, token).await else {
             panic!("replayed assertion should be rejected");
         };
         assert_eq!(error.error_code(), "invalid_grant");
@@ -589,7 +563,7 @@ mod tests {
     #[tokio::test]
     async fn external_exchange_rejects_untrusted_issuer_before_mapping() {
         let untrusted_issuer = "https://untrusted.example";
-        let state = test_state(untrusted_issuer, None, false).await;
+        let state = test_state(untrusted_issuer, None, false, true).await;
         let (token, _) = assertion_token(
             untrusted_issuer,
             &assertion_audience(),
@@ -597,7 +571,7 @@ mod tests {
             TEST_KID,
         );
 
-        let Err(error) = exchange(&state, token, &TestReplayProtection::default()).await else {
+        let Err(error) = production_exchange(&state, token).await else {
             panic!("untrusted issuer should be rejected");
         };
         assert_eq!(error.error_code(), "invalid_grant");
@@ -608,7 +582,7 @@ mod tests {
     async fn external_exchange_rejects_bad_signatures_audiences_and_expired_tokens() {
         let (_server, jwks_url) = jwks_server().await;
         let idp = test_idp(EXTERNAL_ISSUER, &jwks_url);
-        let state = test_state(EXTERNAL_ISSUER, Some(idp), false).await;
+        let state = test_state(EXTERNAL_ISSUER, Some(idp), false, true).await;
 
         let (wrong_audience, _) = assertion_token(
             EXTERNAL_ISSUER,
@@ -620,7 +594,7 @@ mod tests {
             "iss": EXTERNAL_ISSUER,
             "sub": "external-user",
             "aud": assertion_audience(),
-            "exp": chrono::Utc::now().timestamp() - 120,
+            "exp": chrono::Utc::now().timestamp() - 1,
             "jti": "expired",
         });
         let expired = make_jwt(&expired_claims, Some(TEST_KID));
@@ -641,11 +615,59 @@ mod tests {
         };
         bad_signature.replace_range(signature_start..signature_start + 1, replacement);
         for token in [bad_signature, wrong_audience, expired] {
-            let Err(error) = exchange(&state, token, &TestReplayProtection::default()).await else {
+            let Err(error) = production_exchange(&state, token).await else {
                 panic!("invalid assertion should be rejected");
             };
             assert_eq!(error.error_code(), "invalid_grant");
             assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[tokio::test]
+    async fn unmatched_mapping_does_not_consume_replay_capacity() {
+        let (_server, jwks_url) = jwks_server().await;
+        let idp = test_idp(EXTERNAL_ISSUER, &jwks_url);
+        let mut federation = MockFederationProvider::default();
+        federation
+            .expect_get_identity_provider_by_issuer()
+            .returning(move |_, _, _| Ok(Some(idp.clone())));
+        let mut mapping = MockMappingProvider::default();
+        mapping
+            .expect_get_ruleset_by_source()
+            .returning(|_, _, _| Ok(None));
+        mapping.expect_authenticate_by_mapping().times(0);
+        let provider = Provider::mocked_builder()
+            .mock_federation(federation)
+            .mock_mapping(mapping);
+        let mut config = openstack_keystone_config::Config::default();
+        config.oauth2.allow_per_node_assertion_replay = true;
+        let state = openstack_keystone_core::api::tests::get_mocked_state_with_config(
+            provider, true, None, config,
+        )
+        .await;
+        let (token, _) = assertion_token(
+            EXTERNAL_ISSUER,
+            &assertion_audience(),
+            "unmatched",
+            TEST_KID,
+        );
+
+        let Err(error) = production_exchange(&state, token).await else {
+            panic!("assertion with no mapping must be rejected");
+        };
+        assert_eq!(error.error_code(), "invalid_grant");
+        let Some(cache) = &state.assertion_replay else {
+            panic!("test replay cache must be enabled");
+        };
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn replay_cache_quota_errors_fail_closed() {
+        for error in [ReplayError::CacheFull, ReplayError::ScopeQuotaExceeded] {
+            let mapped = map_replay_protection_error(error);
+            assert_eq!(mapped.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(mapped.error_code(), "server_error");
         }
     }
 
